@@ -11,6 +11,14 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import QueryIdInvalid
 import motor.motor_asyncio
 
+# ========== CONFIG ==========
+class Config:
+    API_ID = int(os.environ.get("API_ID", 0))
+    API_HASH = os.environ.get("API_HASH", "")
+    BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+    DB_URL = os.environ.get("DB_URL", "")
+    DB_NAME = "RenameBot"
+
 # ========== FLASK SERVER FOR RENDER ==========
 app_web = Flask(__name__)
 
@@ -25,14 +33,6 @@ def run_flask():
 flask_thread = Thread(target=run_flask)
 flask_thread.daemon = True
 flask_thread.start()
-
-# ========== CONFIG ==========
-class Config:
-    API_ID = 123456  # Replace with your API ID
-    API_HASH = "your_api_hash_here"  # Replace with your API HASH
-    BOT_TOKEN = "your_bot_token_here"  # Replace with your Bot Token
-    DB_URL = "mongodb_url_here"  # Replace with your MongoDB URL
-    DB_NAME = "RenameBot"
 
 # ========== UTILITY FUNCTIONS ==========
 async def progress_for_pyrogram(current, total, ud_type, message, start):
@@ -109,6 +109,14 @@ class Database:
 db = Database(Config.DB_URL, Config.DB_NAME)
 
 # ========== BOT SETUP ==========
+# Validate credentials before starting
+if not all([Config.API_ID, Config.API_HASH, Config.BOT_TOKEN]):
+    print("❌ ERROR: Missing API credentials! Please set environment variables.")
+    print(f"API_ID: {'✅' if Config.API_ID else '❌'}")
+    print(f"API_HASH: {'✅' if Config.API_HASH else '❌'}")
+    print(f"BOT_TOKEN: {'✅' if Config.BOT_TOKEN else '❌'}")
+    exit(1)
+
 app = Client(
     "rename_bot",
     api_id=Config.API_ID,
@@ -398,4 +406,5 @@ async def handle_filename(client, message):
 if __name__ == "__main__":
     print("🚀 Bot is starting...")
     print("🌐 Flask server running on port 8080")
+    print("✅ Credentials validated successfully!")
     app.run()
