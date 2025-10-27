@@ -3,13 +3,13 @@ import asyncio
 import logging
 import math
 import time
-import re  # ADD THIS IMPORT
+import re
 from flask import Flask
 from threading import Thread
 from PIL import Image
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import QueryIdInvalid, MessageNotModified  # ADD MessageNotModified
+from pyrogram.errors import QueryIdInvalid, MessageNotModified
 import motor.motor_asyncio
 
 # ========== CONFIG ==========
@@ -62,14 +62,14 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
         )
         try:
             await message.edit(text=f"**{ud_type}**\n\n{tmp}")
-        except MessageNotModified:  # HANDLE THIS ERROR
+        except MessageNotModified:
             pass
         except Exception:
             pass
 
 def humanbytes(size):    
     if not size:
-        return ""
+        return "0 B"
     power = 2**10
     n = 0
     Dic_powerN = {0: ' ', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
@@ -283,9 +283,26 @@ async def upload_type_callback(client, callback_query):
         new_filename = user_data['new_filename']
         original_message = file_info['original_message']
         
-        # Get original extension
+        # Get original extension - FIXED: Handle None filename
         original_name = file_info['file_name']
-        _, original_ext = os.path.splitext(original_name)
+        if not original_name or original_name == 'Unknown':
+            # Generate extension based on file type
+            if file_info['file_type'] == 'video':
+                original_ext = '.mp4'
+            elif file_info['file_type'] == 'audio':
+                original_ext = '.mp3'
+            else:
+                original_ext = '.bin'
+        else:
+            _, original_ext = os.path.splitext(original_name)
+            if not original_ext:  # If no extension found
+                if file_info['file_type'] == 'video':
+                    original_ext = '.mp4'
+                elif file_info['file_type'] == 'audio':
+                    original_ext = '.mp3'
+                else:
+                    original_ext = '.bin'
+        
         final_filename = f"{new_filename}{original_ext}"
         
         # Download path
@@ -303,7 +320,7 @@ async def upload_type_callback(client, callback_query):
             progress_args=("📥 Downloading", download_msg, start_time)
         )
         
-        if not file_path:
+        if not file_path or not os.path.exists(file_path):
             raise Exception("Download failed")
         
         # Get thumbnail
@@ -362,10 +379,16 @@ async def upload_type_callback(client, callback_query):
     
     finally:
         # Cleanup files
-        if 'file_path' in locals() and os.path.exists(file_path):
-            os.remove(file_path)
+        if 'file_path' in locals() and file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except:
+                pass
         if 'thumb_path' in locals() and thumb_path and os.path.exists(thumb_path):
-            os.remove(thumb_path)
+            try:
+                os.remove(thumb_path)
+            except:
+                pass
         
         # Clear user state
         if user_id in user_states:
@@ -390,7 +413,7 @@ async def handle_filename(client, message):
         await message.reply_text("**❌ Filename cannot be empty!**")
         return
     
-    # Clean filename - FIXED: re is now imported
+    # Clean filename
     clean_name = re.sub(r'[<>:"/\\|?*]', '', new_name)
     
     if not clean_name:
@@ -400,9 +423,27 @@ async def handle_filename(client, message):
     user_states[user_id]['new_filename'] = clean_name
     user_states[user_id]['step'] = 'awaiting_upload_type'
     
-    # Show upload type selection
+    # Show upload type selection - FIXED: Handle None filename
     original_name = user_data['file_info']['file_name']
-    _, original_ext = os.path.splitext(original_name)
+    if not original_name or original_name == 'Unknown':
+        file_type = user_data['file_info']['file_type']
+        if file_type == 'video':
+            original_ext = '.mp4'
+        elif file_type == 'audio':
+            original_ext = '.mp3'
+        else:
+            original_ext = '.bin'
+    else:
+        _, original_ext = os.path.splitext(original_name)
+        if not original_ext:
+            file_type = user_data['file_info']['file_type']
+            if file_type == 'video':
+                original_ext = '.mp4'
+            elif file_type == 'audio':
+                original_ext = '.mp3'
+            else:
+                original_ext = '.bin'
+    
     final_name = f"{clean_name}{original_ext}"
     
     keyboard = InlineKeyboardMarkup([
