@@ -4,9 +4,8 @@ import logging
 import math
 import time
 import re
-from flask import Flask
-from threading import Thread
-from PIL import Image
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import QueryIdInvalid, MessageNotModified
@@ -20,48 +19,60 @@ class Config:
     DB_URL = os.environ.get("DB_URL", "")
     DB_NAME = "RenameBot"
 
-# ========== FLASK SERVER FOR RENDER ==========
-app_web = Flask(__name__)
+# ========== SIMPLE HTTP SERVER FOR RENDER PORT ==========
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Bot is running!')
+    
+    def log_message(self, format, *args):
+        pass
 
-@app_web.route('/')
-def home():
-    return "Bot is running!"
+def run_health_server():
+    server = HTTPServer(('0.0.0.0', 8080), HealthHandler)
+    print("🌐 Health check server running on port 8080")
+    server.serve_forever()
 
-def run_flask():
-    app_web.run(host='0.0.0.0', port=8080, debug=False)
-
-# Start Flask server in a thread
-flask_thread = Thread(target=run_flask)
-flask_thread.daemon = True
-flask_thread.start()
+# Start health server in background
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
 
 # ========== UTILITY FUNCTIONS ==========
-async def progress_for_pyrogram(current, total, ud_type, message, start):
+async def progress_for_pyrogram(current, total, ud_type, message, start, filename):
     now = time.time()
     diff = now - start
-    if round(diff % 5.00) == 0 or current == total:        
+    if round(diff % 2.00) == 0 or current == total:  # Update every 2 seconds
         percentage = current * 100 / total
-        speed = current / diff
+        speed = current / diff if diff > 0 else 0
         elapsed_time = round(diff) * 1000
-        time_to_completion = round((total - current) / speed) * 1000
+        time_to_completion = round((total - current) / speed) * 1000 if speed > 0 else 0
         estimated_total_time = elapsed_time + time_to_completion
 
         elapsed_time = TimeFormatter(milliseconds=elapsed_time)
         estimated_total_time = TimeFormatter(milliseconds=estimated_total_time)
 
-        progress = "{0}{1}".format(
-            ''.join(["■" for i in range(math.floor(percentage / 8.34))]),
-            ''.join(["□" for i in range(12 - math.floor(percentage / 8.34))])
-        )            
-        tmp = progress + " {0}%\n├ 🗂️ {1} / {2}\n├ 🚀 {3}/s\n└ ⏰ {4}".format(
-            round(percentage, 2),
-            humanbytes(current),
-            humanbytes(total),
-            humanbytes(speed),            
-            estimated_total_time if estimated_total_time != '' else "0 s"
-        )
+        # Progress bar with 10 blocks
+        filled_blocks = math.floor(percentage / 10)
+        empty_blocks = 10 - filled_blocks
+        progress_bar = "▣" * filled_blocks + "□" * empty_blocks
+        
+        progress_text = f"""
+{ud_type}
+
+📄 **File:** `{filename}`
+
+[{progress_bar}] {round(percentage, 1)}%
+
+💾 **Size:** {humanbytes(current)} / {humanbytes(total)}
+
+🚀 **Speed:** {humanbytes(speed)}/s
+
+⏰ **ETA:** {estimated_total_time if estimated_total_time != '' else '0s'}
+"""
         try:
-            await message.edit(text=f"**{ud_type}**\n\n{tmp}")
+            await message.edit(text=progress_text)
         except MessageNotModified:
             pass
         except Exception:
@@ -72,26 +83,26 @@ def humanbytes(size):
         return "0 B"
     power = 2**10
     n = 0
-    Dic_powerN = {0: ' ', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
-    while size > power:
+    Dic_powerN = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
+    while size > power and n < len(Dic_powerN) - 1:
         size /= power
         n += 1
-    return str(round(size, 2)) + " " + Dic_powerN[n] + 'B'
+    return f"{size:.1f} {Dic_powerN[n]}"
 
 def TimeFormatter(milliseconds: int) -> str:
     seconds, milliseconds = divmod(int(milliseconds), 1000)
     minutes, seconds = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
-    days, hours = divmod(hours, 24)
-    tmp = ((str(days) + "d, ") if days else "") + \
-        ((str(hours) + "h, ") if hours else "") + \
-        ((str(minutes) + "m, ") if minutes else "") + \
-        ((str(seconds) + "s, ") if seconds else "") + \
-        ((str(milliseconds) + "ms, ") if milliseconds else "")
-    return tmp[:-2] 
+    
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m {seconds}s"
+    else:
+        return f"{seconds}s"
 
 def convert_seconds(seconds):
-    """Convert seconds to HH:MM:SS format"""
+    """Convert seconds to MM:SS or HH:MM:SS format"""
     seconds = int(seconds)
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
@@ -205,7 +216,7 @@ async def handle_file(client, message):
     elif message.video:
         file = message.video
         file_type = "video"
-        duration = getattr(file, 'duration', 0)  # Get actual video duration
+        duration = getattr(file, 'duration', 0)
     elif message.audio:
         file = message.audio
         file_type = "audio"
@@ -242,8 +253,8 @@ async def handle_file(client, message):
 **Click RENAME to continue.**"""
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Rename", callback_data="start_rename")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_process")]
+        [InlineKeyboardButton("🔄 Rename", callback_data="start_rename")]
+        # Removed cancel button
     ])
     
     await message.reply_text(info_text, reply_markup=keyboard)
@@ -259,28 +270,23 @@ async def start_rename_callback(client, callback_query):
     
     user_states[user_id]['step'] = 'awaiting_filename'
     
+    # Delete the rename prompt message
     try:
-        await callback_query.message.edit_text(
-            "**📝 Enter the new filename:**\n\n"
-            "**Note:** Don't include file extension\n"
-            "Example: `my_renamed_file`",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_process")]
-            ])
-        )
-    except MessageNotModified:
+        await callback_query.message.delete()
+    except:
         pass
-    await callback_query.answer()
-
-@app.on_callback_query(filters.regex("^cancel_process$"))
-async def cancel_callback(client, callback_query):
-    user_id = callback_query.from_user.id
-    if user_id in user_states:
-        del user_states[user_id]
-    try:
-        await callback_query.message.edit_text("**❌ Process cancelled!**")
-    except MessageNotModified:
-        pass
+    
+    # Ask for filename directly without buttons
+    ask_msg = await callback_query.message.reply_text(
+        "**📝 Please reply with the new filename:**\n\n"
+        "**Note:** Don't include file extension\n"
+        "Example: `my_renamed_file`\n\n"
+        "💡 *You can reply to this message*"
+    )
+    
+    # Store the ask message ID for auto-reply
+    user_states[user_id]['ask_message_id'] = ask_msg.id
+    
     await callback_query.answer()
 
 @app.on_callback_query(filters.regex("^upload_(document|video)$"))
@@ -295,7 +301,11 @@ async def upload_type_callback(client, callback_query):
     user_data = user_states[user_id]
     
     try:
-        await callback_query.message.edit_text("**🔄 Starting process...**")
+        # Delete the selection message
+        try:
+            await callback_query.message.delete()
+        except:
+            pass
         
         file_info = user_data['file_info']
         new_filename = user_data['new_filename']
@@ -327,77 +337,59 @@ async def upload_type_callback(client, callback_query):
         download_path = f"downloads/{final_filename}"
         os.makedirs("downloads", exist_ok=True)
         
-        # Download file
-        download_msg = await callback_query.message.edit_text("**📥 Downloading...**")
+        # Create progress message
+        progress_msg = await callback_query.message.reply_text("🔄 Processing your file...")
+        
+        # Download file with progress
         start_time = time.time()
         
         file_path = await client.download_media(
             original_message,
             file_name=download_path,
             progress=progress_for_pyrogram,
-            progress_args=("📥 Downloading", download_msg, start_time)
+            progress_args=("📥 **Downloading File**", progress_msg, start_time, final_filename)
         )
         
         if not file_path or not os.path.exists(file_path):
             raise Exception("Download failed")
         
-        # Get thumbnail - FIXED: Better thumbnail handling
+        # Get thumbnail
         thumbnail = await db.get_thumbnail(user_id)
         thumb_path = None
-        
-        # Process custom thumbnail if available
         if thumbnail:
             try:
                 thumb_path = await client.download_media(thumbnail)
-                # Process thumbnail to ensure compatibility
-                if thumb_path and os.path.exists(thumb_path):
-                    try:
-                        with Image.open(thumb_path) as img:
-                            img = img.convert("RGB")
-                            # Resize to optimal size for Telegram
-                            img.thumbnail((320, 320), Image.Resampling.LANCZOS)
-                            img.save(thumb_path, "JPEG", quality=95)
-                    except Exception as thumb_error:
-                        logging.warning(f"Thumbnail processing failed: {thumb_error}")
-                        # If processing fails, use original thumbnail
-            except Exception as e:
-                logging.warning(f"Failed to download custom thumbnail: {e}")
+            except:
+                pass
         
-        # If no custom thumbnail and it's a video, try to use video's thumbnail
-        if not thumb_path and file_info['file_type'] == 'video':
-            try:
-                if hasattr(original_message.video, 'thumbs') and original_message.video.thumbs:
-                    thumb_path = await client.download_media(original_message.video.thumbs[0].file_id)
-            except Exception as e:
-                logging.warning(f"Failed to get video thumbnail: {e}")
-        
-        # Upload file with proper duration and thumbnail
-        try:
-            await download_msg.edit_text("**📤 Uploading...**")
-        except MessageNotModified:
-            pass
+        # Upload file with progress (no separate "Uploading" message)
         start_time = time.time()
         
-        if upload_type == "document":
+        # Check if file should be forced as document
+        force_document = False
+        if original_ext.lower() in ['.pdf', '.html', '.htm', '.txt', '.doc', '.docx']:
+            force_document = True
+            upload_type = "document"
+        
+        if upload_type == "document" or force_document:
             await client.send_document(
                 callback_query.message.chat.id,
                 document=file_path,
                 thumb=thumb_path,
                 caption=f"`{final_filename}`",
                 progress=progress_for_pyrogram,
-                progress_args=("📤 Uploading", download_msg, start_time)
+                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
             )
         else:  # video
-            # Use original duration for video uploads
             await client.send_video(
                 callback_query.message.chat.id,
                 video=file_path,
                 thumb=thumb_path,
                 caption=f"`{final_filename}`",
-                duration=original_duration,  # Use actual video duration
+                duration=original_duration,
                 supports_streaming=True,
                 progress=progress_for_pyrogram,
-                progress_args=("📤 Uploading", download_msg, start_time)
+                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
             )
         
         # Success message
@@ -409,18 +401,15 @@ async def upload_type_callback(client, callback_query):
             f"**Duration:** `{duration_text}`"
         )
         
-        # Cleanup download message
+        # Cleanup progress message
         try:
-            await download_msg.delete()
+            await progress_msg.delete()
         except:
             pass
             
     except Exception as e:
         error_msg = f"**❌ Error:** `{str(e)}`"
-        try:
-            await callback_query.message.edit_text(error_msg)
-        except MessageNotModified:
-            await callback_query.message.reply_text(error_msg)
+        await callback_query.message.reply_text(error_msg)
         logging.error(f"Upload error: {e}")
     
     finally:
@@ -469,6 +458,18 @@ async def handle_filename(client, message):
     user_states[user_id]['new_filename'] = clean_name
     user_states[user_id]['step'] = 'awaiting_upload_type'
     
+    # Delete the user's filename message and the ask message
+    try:
+        await message.delete()
+    except:
+        pass
+    
+    try:
+        if 'ask_message_id' in user_data:
+            await client.delete_messages(message.chat.id, user_data['ask_message_id'])
+    except:
+        pass
+    
     # Show upload type selection
     original_name = user_data['file_info']['file_name']
     if not original_name or original_name == 'Unknown':
@@ -492,10 +493,17 @@ async def handle_filename(client, message):
     
     final_name = f"{clean_name}{original_ext}"
     
+    # Auto-select document for specific file types
+    if original_ext.lower() in ['.pdf', '.html', '.htm', '.txt', '.doc', '.docx']:
+        # Auto-upload as document without asking
+        user_states[user_id]['step'] = 'processing'
+        await handle_auto_upload(client, message, user_id, final_name, "document")
+        return
+    
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📄 Document", callback_data="upload_document")],
-        [InlineKeyboardButton("🎥 Video", callback_data="upload_video")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_process")]
+        [InlineKeyboardButton("🎥 Video", callback_data="upload_video")]
+        # Removed cancel button
     ])
     
     await message.reply_text(
@@ -503,9 +511,93 @@ async def handle_filename(client, message):
         reply_markup=keyboard
     )
 
+async def handle_auto_upload(client, message, user_id, final_name, upload_type):
+    """Handle automatic upload for document files"""
+    user_data = user_states[user_id]
+    
+    try:
+        file_info = user_data['file_info']
+        original_message = file_info['original_message']
+        original_duration = file_info['duration']
+        
+        # Download path
+        download_path = f"downloads/{final_name}"
+        os.makedirs("downloads", exist_ok=True)
+        
+        # Create progress message
+        progress_msg = await message.reply_text("🔄 Processing your file...")
+        
+        # Download file with progress
+        start_time = time.time()
+        
+        file_path = await client.download_media(
+            original_message,
+            file_name=download_path,
+            progress=progress_for_pyrogram,
+            progress_args=("📥 **Downloading File**", progress_msg, start_time, final_name)
+        )
+        
+        if not file_path or not os.path.exists(file_path):
+            raise Exception("Download failed")
+        
+        # Get thumbnail
+        thumbnail = await db.get_thumbnail(user_id)
+        thumb_path = None
+        if thumbnail:
+            try:
+                thumb_path = await client.download_media(thumbnail)
+            except:
+                pass
+        
+        # Upload file with progress
+        start_time = time.time()
+        
+        await client.send_document(
+            message.chat.id,
+            document=file_path,
+            thumb=thumb_path,
+            caption=f"`{final_name}`",
+            progress=progress_for_pyrogram,
+            progress_args=("📤 **Uploading File**", progress_msg, start_time, final_name)
+        )
+        
+        # Success message
+        await message.reply_text(
+            f"**✅ File Renamed Successfully!**\n\n"
+            f"**New Name:** `{final_name}`\n"
+            f"**Type:** `Document`"
+        )
+        
+        # Cleanup progress message
+        try:
+            await progress_msg.delete()
+        except:
+            pass
+            
+    except Exception as e:
+        error_msg = f"**❌ Error:** `{str(e)}`"
+        await message.reply_text(error_msg)
+        logging.error(f"Upload error: {e}")
+    
+    finally:
+        # Cleanup files
+        if 'file_path' in locals() and file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except:
+                pass
+        if 'thumb_path' in locals() and thumb_path and os.path.exists(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except:
+                pass
+        
+        # Clear user state
+        if user_id in user_states:
+            del user_states[user_id]
+
 # ========== START BOT ==========
 if __name__ == "__main__":
     print("🚀 Bot is starting...")
-    print("🌐 Flask server running on port 8080")
-    print("✅ Credentials validated successfully!")
+    print("🌐 Health check server running on port 8080")
     app.run()
