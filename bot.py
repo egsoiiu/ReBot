@@ -90,6 +90,17 @@ def TimeFormatter(milliseconds: int) -> str:
         ((str(milliseconds) + "ms, ") if milliseconds else "")
     return tmp[:-2] 
 
+def convert_seconds(seconds):
+    """Convert seconds to HH:MM:SS format"""
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    else:
+        return f"{minutes:02d}:{seconds:02d}"
+
 # ========== DATABASE CLASS ==========
 class Database:
     def __init__(self, uri, database_name):
@@ -190,36 +201,43 @@ async def handle_file(client, message):
     if message.document:
         file = message.document
         file_type = "document"
+        duration = 0
     elif message.video:
         file = message.video
         file_type = "video"
+        duration = getattr(file, 'duration', 0)  # Get actual video duration
     elif message.audio:
         file = message.audio
         file_type = "audio"
+        duration = getattr(file, 'duration', 0)
     else:
         return
 
     file_name = getattr(file, 'file_name', 'Unknown')
     file_size = humanbytes(getattr(file, 'file_size', 0))
     
-    # Store file info
+    # Store file info with duration
     user_states[user_id] = {
         'file_info': {
             'file_name': file_name,
             'file_size': file_size,
             'file_type': file_type,
+            'duration': duration,
             'original_message': message,
             'file_id': file.file_id
         },
         'step': 'awaiting_rename'
     }
 
-    # Show file info with buttons
+    # Show file info with buttons - include duration
+    duration_text = convert_seconds(duration) if duration > 0 else "Not available"
+    
     info_text = f"""**📁 File Information:**
 
 **Name:** `{file_name}`
 **Size:** `{file_size}`
 **Type:** `{file_type.title()}`
+**Duration:** `{duration_text}`
 
 **Click RENAME to continue.**"""
 
@@ -282,11 +300,11 @@ async def upload_type_callback(client, callback_query):
         file_info = user_data['file_info']
         new_filename = user_data['new_filename']
         original_message = file_info['original_message']
+        original_duration = file_info['duration']
         
-        # Get original extension - FIXED: Handle None filename
+        # Get original extension
         original_name = file_info['file_name']
         if not original_name or original_name == 'Unknown':
-            # Generate extension based on file type
             if file_info['file_type'] == 'video':
                 original_ext = '.mp4'
             elif file_info['file_type'] == 'audio':
@@ -295,7 +313,7 @@ async def upload_type_callback(client, callback_query):
                 original_ext = '.bin'
         else:
             _, original_ext = os.path.splitext(original_name)
-            if not original_ext:  # If no extension found
+            if not original_ext:
                 if file_info['file_type'] == 'video':
                     original_ext = '.mp4'
                 elif file_info['file_type'] == 'audio':
@@ -323,13 +341,37 @@ async def upload_type_callback(client, callback_query):
         if not file_path or not os.path.exists(file_path):
             raise Exception("Download failed")
         
-        # Get thumbnail
+        # Get thumbnail - FIXED: Better thumbnail handling
         thumbnail = await db.get_thumbnail(user_id)
         thumb_path = None
-        if thumbnail:
-            thumb_path = await client.download_media(thumbnail)
         
-        # Upload file
+        # Process custom thumbnail if available
+        if thumbnail:
+            try:
+                thumb_path = await client.download_media(thumbnail)
+                # Process thumbnail to ensure compatibility
+                if thumb_path and os.path.exists(thumb_path):
+                    try:
+                        with Image.open(thumb_path) as img:
+                            img = img.convert("RGB")
+                            # Resize to optimal size for Telegram
+                            img.thumbnail((320, 320), Image.Resampling.LANCZOS)
+                            img.save(thumb_path, "JPEG", quality=95)
+                    except Exception as thumb_error:
+                        logging.warning(f"Thumbnail processing failed: {thumb_error}")
+                        # If processing fails, use original thumbnail
+            except Exception as e:
+                logging.warning(f"Failed to download custom thumbnail: {e}")
+        
+        # If no custom thumbnail and it's a video, try to use video's thumbnail
+        if not thumb_path and file_info['file_type'] == 'video':
+            try:
+                if hasattr(original_message.video, 'thumbs') and original_message.video.thumbs:
+                    thumb_path = await client.download_media(original_message.video.thumbs[0].file_id)
+            except Exception as e:
+                logging.warning(f"Failed to get video thumbnail: {e}")
+        
+        # Upload file with proper duration and thumbnail
         try:
             await download_msg.edit_text("**📤 Uploading...**")
         except MessageNotModified:
@@ -346,21 +388,25 @@ async def upload_type_callback(client, callback_query):
                 progress_args=("📤 Uploading", download_msg, start_time)
             )
         else:  # video
+            # Use original duration for video uploads
             await client.send_video(
                 callback_query.message.chat.id,
                 video=file_path,
                 thumb=thumb_path,
                 caption=f"`{final_filename}`",
+                duration=original_duration,  # Use actual video duration
                 supports_streaming=True,
                 progress=progress_for_pyrogram,
                 progress_args=("📤 Uploading", download_msg, start_time)
             )
         
         # Success message
+        duration_text = convert_seconds(original_duration) if original_duration > 0 else "Unknown"
         await callback_query.message.reply_text(
             f"**✅ File Renamed Successfully!**\n\n"
             f"**New Name:** `{final_filename}`\n"
-            f"**Type:** `{upload_type.title()}`"
+            f"**Type:** `{upload_type.title()}`\n"
+            f"**Duration:** `{duration_text}`"
         )
         
         # Cleanup download message
@@ -423,7 +469,7 @@ async def handle_filename(client, message):
     user_states[user_id]['new_filename'] = clean_name
     user_states[user_id]['step'] = 'awaiting_upload_type'
     
-    # Show upload type selection - FIXED: Handle None filename
+    # Show upload type selection
     original_name = user_data['file_info']['file_name']
     if not original_name or original_name == 'Unknown':
         file_type = user_data['file_info']['file_type']
