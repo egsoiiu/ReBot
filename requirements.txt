@@ -1,4 +1,4 @@
 pyrogram==2.0.106
 tgcrypto==1.2.5
 motor==3.3.2
-pillow==9.5.0
+Pillow==9.5.0 --only-binary=all  # Use pre-built wheels
