@@ -112,6 +112,11 @@ def convert_seconds(seconds):
     else:
         return f"{minutes:02d}:{seconds:02d}"
 
+# Simple thumbnail processing without PIL
+async def process_thumb_async(ph_path):
+    """Simple thumbnail pass-through without PIL"""
+    pass
+
 # ========== DATABASE CLASS ==========
 class Database:
     def __init__(self, uri, database_name):
