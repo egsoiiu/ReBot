@@ -3,12 +3,13 @@ import asyncio
 import logging
 import math
 import time
+import re  # ADD THIS IMPORT
 from flask import Flask
 from threading import Thread
 from PIL import Image
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import QueryIdInvalid
+from pyrogram.errors import QueryIdInvalid, MessageNotModified  # ADD MessageNotModified
 import motor.motor_asyncio
 
 # ========== CONFIG ==========
@@ -61,7 +62,9 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
         )
         try:
             await message.edit(text=f"**{ud_type}**\n\n{tmp}")
-        except:
+        except MessageNotModified:  # HANDLE THIS ERROR
+            pass
+        except Exception:
             pass
 
 def humanbytes(size):    
@@ -109,7 +112,6 @@ class Database:
 db = Database(Config.DB_URL, Config.DB_NAME)
 
 # ========== BOT SETUP ==========
-# Validate credentials before starting
 if not all([Config.API_ID, Config.API_HASH, Config.BOT_TOKEN]):
     print("❌ ERROR: Missing API credentials! Please set environment variables.")
     print(f"API_ID: {'✅' if Config.API_ID else '❌'}")
@@ -239,14 +241,17 @@ async def start_rename_callback(client, callback_query):
     
     user_states[user_id]['step'] = 'awaiting_filename'
     
-    await callback_query.message.edit_text(
-        "**📝 Enter the new filename:**\n\n"
-        "**Note:** Don't include file extension\n"
-        "Example: `my_renamed_file`",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_process")]
-        ])
-    )
+    try:
+        await callback_query.message.edit_text(
+            "**📝 Enter the new filename:**\n\n"
+            "**Note:** Don't include file extension\n"
+            "Example: `my_renamed_file`",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_process")]
+            ])
+        )
+    except MessageNotModified:
+        pass
     await callback_query.answer()
 
 @app.on_callback_query(filters.regex("^cancel_process$"))
@@ -254,7 +259,10 @@ async def cancel_callback(client, callback_query):
     user_id = callback_query.from_user.id
     if user_id in user_states:
         del user_states[user_id]
-    await callback_query.message.edit_text("**❌ Process cancelled!**")
+    try:
+        await callback_query.message.edit_text("**❌ Process cancelled!**")
+    except MessageNotModified:
+        pass
     await callback_query.answer()
 
 @app.on_callback_query(filters.regex("^upload_(document|video)$"))
@@ -305,7 +313,10 @@ async def upload_type_callback(client, callback_query):
             thumb_path = await client.download_media(thumbnail)
         
         # Upload file
-        await download_msg.edit_text("**📤 Uploading...**")
+        try:
+            await download_msg.edit_text("**📤 Uploading...**")
+        except MessageNotModified:
+            pass
         start_time = time.time()
         
         if upload_type == "document":
@@ -343,7 +354,10 @@ async def upload_type_callback(client, callback_query):
             
     except Exception as e:
         error_msg = f"**❌ Error:** `{str(e)}`"
-        await callback_query.message.edit_text(error_msg)
+        try:
+            await callback_query.message.edit_text(error_msg)
+        except MessageNotModified:
+            await callback_query.message.reply_text(error_msg)
         logging.error(f"Upload error: {e}")
     
     finally:
@@ -376,7 +390,7 @@ async def handle_filename(client, message):
         await message.reply_text("**❌ Filename cannot be empty!**")
         return
     
-    # Clean filename
+    # Clean filename - FIXED: re is now imported
     clean_name = re.sub(r'[<>:"/\\|?*]', '', new_name)
     
     if not clean_name:
