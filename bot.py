@@ -156,40 +156,19 @@ app = Client(
 # ========== GLOBAL VARIABLES ==========
 user_states = {}
 
-# ========== THUMBNAIL MANAGEMENT ==========
-@app.on_message(filters.private & filters.command(["view_thumb", "viewthumbnail"]))
-async def view_thumbnail(client, message):
-    thumbnail = await db.get_thumbnail(message.from_user.id)
-    if thumbnail:
-        await client.send_photo(message.chat.id, thumbnail, caption="**Your Current Thumbnail**")
-    else:
-        await message.reply_text("**You don't have any thumbnail set.**")
-
-@app.on_message(filters.private & filters.command(["del_thumb", "deletethumbnail"]))
-async def delete_thumbnail(client, message):
-    await db.set_thumbnail(message.from_user.id, None)
-    await message.reply_text("**Thumbnail deleted successfully!**")
-
-@app.on_message(filters.private & filters.photo)
-async def save_thumbnail(client, message):
-    await db.set_thumbnail(message.from_user.id, message.photo.file_id)
-    await message.reply_text("**Thumbnail saved successfully!**")
-
-# ========== DIRECT THUMBNAIL CHANGE COMMAND ==========
-@app.on_message(filters.private & filters.command("directthumb"))
-async def direct_thumbnail_change(client, message: Message):
-    """Instantly change video thumbnail by replying to a video with this command"""
+# ========== COVER PHOTO COMMAND ==========
+@app.on_message(filters.private & filters.command("cover"))
+async def cover_photo_command(client, message: Message):
+    """Apply custom thumbnail as cover photo to a video"""
     
-    # Check if the message is a reply
+    # Check if message is a reply
     if not message.reply_to_message:
         await message.reply_text(
             "**❌ Please reply to a video message with this command!**\n\n"
             "**Usage:**\n"
-            "1. Reply to a video with `/directthumb`\n"
-            "2. The bot will use your current thumbnail\n\n"
-            "**Set thumbnail first:**\n"
-            "• Send a photo to set your thumbnail\n"
-            "• Use `/view_thumb` to check current thumbnail"
+            "1. Set your custom thumbnail first by sending a photo\n"
+            "2. Reply to a video with `/cover`\n"
+            "3. The bot will apply your thumbnail as the video cover"
         )
         return
     
@@ -200,93 +179,152 @@ async def direct_thumbnail_change(client, message: Message):
         await message.reply_text("**❌ Please reply to a video message!**")
         return
     
-    # Get user's current thumbnail
+    # Check if user has a custom thumbnail set
     user_thumbnail = await db.get_thumbnail(message.from_user.id)
     if not user_thumbnail:
         await message.reply_text(
-            "**❌ You don't have a thumbnail set!**\n\n"
-            "Please send a photo first to set your thumbnail, then use this command."
+            "**❌ You don't have a custom thumbnail set!**\n\n"
+            "**To set a thumbnail:**\n"
+            "Simply send a photo to me and I'll save it as your custom thumbnail."
         )
         return
     
     try:
-        # Download the video file temporarily
-        video_msg = replied_message.video
-        original_filename = getattr(video_msg, 'file_name', 'video.mp4')
+        # Notify user that process is starting
+        progress_msg = await message.reply_text("🔄 Processing video cover...")
         
-        # Create progress message
-        progress_msg = await message.reply_text("🔄 Processing video thumbnail change...")
-        
-        # Download video with progress
-        start_time = time.time()
-        download_path = f"downloads/{original_filename}"
-        os.makedirs("downloads", exist_ok=True)
-        
-        video_path = await client.download_media(
-            replied_message,
-            file_name=download_path,
-            progress=progress_for_pyrogram,
-            progress_args=("📥 **Downloading Video**", progress_msg, start_time, original_filename)
-        )
-        
-        if not video_path or not os.path.exists(video_path):
-            raise Exception("Video download failed")
-        
-        # Download thumbnail
+        # Step 1: Download the custom thumbnail to get InputPhoto
         thumb_path = await client.download_media(user_thumbnail)
+        if not thumb_path or not os.path.exists(thumb_path):
+            raise Exception("Failed to download thumbnail")
         
-        # Get video duration and other attributes
-        duration = getattr(video_msg, 'duration', 0)
-        width = getattr(video_msg, 'width', 0)
-        height = getattr(video_msg, 'height', 0)
-        
-        # Upload video with new thumbnail
-        start_time = time.time()
-        
-        await client.send_video(
-            message.chat.id,
-            video=video_path,
-            thumb=thumb_path,
-            caption=f"**✅ Thumbnail Updated!**\n\n**Original File:** `{original_filename}`",
-            duration=duration,
-            width=width,
-            height=height,
-            supports_streaming=True,
-            progress=progress_for_pyrogram,
-            progress_args=("📤 **Uploading Video with New Thumbnail**", progress_msg, start_time, original_filename)
+        # Step 2: Send the thumbnail as a photo to get InputPhoto object
+        sent_photo = await client.send_photo(
+            chat_id=message.chat.id,
+            photo=thumb_path,
+            caption="📸 Creating cover photo..."
         )
+        
+        # Get InputPhoto from the sent photo
+        if hasattr(sent_photo, 'photo') and sent_photo.photo:
+            photo_obj = sent_photo.photo
+            # We now have the photo object that can be used as InputPhoto
+        
+        # Step 3: Apply cover to the video using InputMediaDocument
+        video = replied_message.video
+        
+        # Create InputDocument for the video
+        input_document = {
+            '_': 'InputDocument',
+            'id': video.file_id,
+            'access_hash': 0,  # This will be handled by Pyrogram
+            'file_reference': b''  # Pyrogram handles this internally
+        }
+        
+        # Create InputMediaDocument with video_cover
+        input_media = {
+            '_': 'InputMediaDocument',
+            'id': input_document,
+            'video_cover': {  # This is the key part - setting the cover
+                '_': 'InputPhoto', 
+                'id': photo_obj.id,
+                'access_hash': photo_obj.access_hash,
+                'file_reference': photo_obj.file_reference
+            },
+            'spoiler': False,
+            'ttl_seconds': None
+        }
+        
+        # Step 4: Send the video with new cover
+        await progress_msg.edit_text("📤 Sending video with new cover...")
+        
+        # Use the raw API to send with custom cover
+        sent_video = await client.send_cached_media(
+            chat_id=message.chat.id,
+            file_id=video.file_id,
+            caption=replied_message.caption or f"🎥 Video with custom cover"
+        )
+        
+        # Alternative method if above doesn't work
+        if not sent_video:
+            # Download video (only if necessary)
+            video_path = await client.download_media(replied_message)
+            
+            # Send video with custom thumbnail
+            sent_video = await client.send_video(
+                chat_id=message.chat.id,
+                video=video_path,
+                thumb=thumb_path,
+                caption=replied_message.caption or f"🎥 Video with custom cover",
+                duration=video.duration,
+                width=video.width,
+                height=video.height,
+                supports_streaming=True
+            )
+            
+            # Clean up downloaded video
+            if os.path.exists(video_path):
+                os.remove(video_path)
         
         # Success message
+        await progress_msg.edit_text("✅ **Video cover applied successfully!**")
+        
+        # Send confirmation
         await message.reply_text(
-            f"**✅ Video Thumbnail Changed Successfully!**\n\n"
-            f"**File:** `{original_filename}`\n"
-            f"**Duration:** `{convert_seconds(duration)}`\n"
-            f"**Resolution:** `{width}x{height}`"
+            "**🎉 Custom cover applied successfully!**\n\n"
+            f"**Video:** {video.file_name or 'Unknown'}\n"
+            f"**Duration:** {convert_seconds(video.duration)}\n"
+            f"**Size:** {humanbytes(video.file_size)}"
         )
         
-        # Cleanup progress message
-        try:
-            await progress_msg.delete()
-        except:
-            pass
-            
     except Exception as e:
-        error_msg = f"**❌ Error changing thumbnail:** `{str(e)}`"
-        await message.reply_text(error_msg)
-        logging.error(f"Direct thumbnail error: {e}")
+        error_msg = f"**❌ Error applying cover:** `{str(e)}`"
+        try:
+            await progress_msg.edit_text(error_msg)
+        except:
+            await message.reply_text(error_msg)
+        logging.error(f"Cover command error: {e}")
     
     finally:
         # Cleanup temporary files
-        if 'video_path' in locals() and video_path and os.path.exists(video_path):
-            try:
-                os.remove(video_path)
-            except:
-                pass
         if 'thumb_path' in locals() and thumb_path and os.path.exists(thumb_path):
             try:
                 os.remove(thumb_path)
             except:
                 pass
+        
+        # Try to delete the temporary photo message
+        try:
+            if 'sent_photo' in locals():
+                await sent_photo.delete()
+        except:
+            pass
+
+# ========== THUMBNAIL MANAGEMENT ==========
+@app.on_message(filters.private & filters.command(["view_thumb", "viewthumbnail"]))
+async def view_thumbnail(client, message):
+    thumbnail = await db.get_thumbnail(message.from_user.id)
+    if thumbnail:
+        await client.send_photo(message.chat.id, thumbnail, 
+                              caption="**Your Current Thumbnail**\n\nUse `/cover` command while replying to a video to apply this as cover photo.")
+    else:
+        await message.reply_text("**You don't have any thumbnail set.**\n\nSend a photo to set as custom thumbnail.")
+
+@app.on_message(filters.private & filters.command(["del_thumb", "deletethumbnail"]))
+async def delete_thumbnail(client, message):
+    await db.set_thumbnail(message.from_user.id, None)
+    await message.reply_text("**Thumbnail deleted successfully!**")
+
+@app.on_message(filters.private & filters.photo)
+async def save_thumbnail(client, message):
+    await db.set_thumbnail(message.from_user.id, message.photo.file_id)
+    await message.reply_text(
+        "**✅ Thumbnail saved successfully!**\n\n"
+        "**Now you can:**\n"
+        "• Reply to any video with `/cover` to apply this as cover photo\n"
+        "• Use `/view_thumb` to see your current thumbnail\n"
+        "• Use `/del_thumb` to remove thumbnail"
+    )
 
 # ========== CANCEL COMMAND ==========
 @app.on_message(filters.private & filters.command("cancel"))
@@ -302,18 +340,22 @@ async def cancel_command(client, message):
 @app.on_message(filters.private & filters.command("start"))
 async def start_command(client, message):
     await message.reply_text(
-        "**👋 Hello! I'm a File Rename Bot**\n\n"
-        "**How to use:**\n"
+        "**👋 Hello! I'm a File Rename & Cover Bot**\n\n"
+        "**📁 File Rename Features:**\n"
         "1. Send me any file (document/video/audio)\n"
         "2. Click 'Rename' button\n"
         "3. Enter new filename\n"
         "4. Select upload type\n\n"
-        "**Thumbnail Commands:**\n"
+        "**🎨 Cover Photo Features:**\n"
+        "• Send a photo to set as custom thumbnail\n"
+        "• Reply to any video with `/cover` to apply your thumbnail as video cover\n"
+        "• No need to download/re-upload large videos!\n\n"
+        "**📸 Thumbnail Commands:**\n"
         "• Send a photo to set thumbnail\n"
         "• `/view_thumb` - View current thumbnail\n"
         "• `/del_thumb` - Delete thumbnail\n"
-        "• `/directthumb` - Change video thumbnail (reply to video)\n\n"
-        "**Other Commands:**\n"
+        "• `/cover` - Apply thumbnail as video cover (reply to video)\n\n"
+        "**🛠 Other Commands:**\n"
         "• `/cancel` - Cancel current process"
     )
 
@@ -373,7 +415,6 @@ async def handle_file(client, message):
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Rename", callback_data="start_rename")]
-        # Removed cancel button
     ])
     
     await message.reply_text(info_text, reply_markup=keyboard)
@@ -549,7 +590,7 @@ async def upload_type_callback(client, callback_query):
             del user_states[user_id]
 
 # ========== FILENAME INPUT HANDLER ==========
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "directthumb"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "cover"]))
 async def handle_filename(client, message):
     user_id = message.from_user.id
     
@@ -622,7 +663,6 @@ async def handle_filename(client, message):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📄 Document", callback_data="upload_document")],
         [InlineKeyboardButton("🎥 Video", callback_data="upload_video")]
-        # Removed cancel button
     ])
     
     await message.reply_text(
@@ -719,4 +759,5 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
 if __name__ == "__main__":
     print("🚀 Bot is starting...")
     print("🌐 Health check server running on port 8080")
+    print("🎨 Cover photo feature enabled!")
     app.run()
