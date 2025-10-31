@@ -213,18 +213,32 @@ async def instant_thumbnail_change(client, message):
         # Show processing message
         processing_msg = await message.reply_text("⚡ Changing thumbnail instantly...")
         
-        # METHOD 1: Try using send_video with thumbnail (CORRECTED)
+        # METHOD 1: Try using edit_message_media with custom thumbnail
         try:
+            # First, download the thumbnail to a file
+            thumb_path = f"downloads/thumb_{user_id}_{int(time.time())}.jpg"
+            os.makedirs("downloads", exist_ok=True)
+            
+            # Download thumbnail
+            await client.download_media(thumbnail_file_id, file_name=thumb_path)
+            
+            # Send video with custom thumbnail
             sent_message = await client.send_video(
                 chat_id=message.chat.id,
                 video=original_file_id,
-                thumbnail=thumbnail_file_id,  # ✅ FIXED: thumbnail instead of thumb
+                thumb=thumb_path,  # ✅ CORRECT: Pyrogram uses 'thumb' for file path
                 caption=f"`{original_filename}`\n\n⚡ **Custom Thumbnail Applied!**",
                 duration=duration,
                 width=width,
                 height=height,
                 supports_streaming=True
             )
+            
+            # Cleanup thumbnail file
+            try:
+                os.remove(thumb_path)
+            except:
+                pass
             
             # Delete processing message
             await processing_msg.delete()
@@ -244,21 +258,26 @@ async def instant_thumbnail_change(client, message):
             try:
                 await processing_msg.edit_text("⚡ Trying alternative method...")
                 
-                # Download the video file temporarily
+                # Download both video and thumbnail
                 download_path = f"downloads/{user_id}_{int(time.time())}_{original_filename}"
+                thumb_path = f"downloads/thumb_{user_id}_{int(time.time())}.jpg"
                 os.makedirs("downloads", exist_ok=True)
                 
+                # Download video
                 file_path = await client.download_media(
                     video_message,
                     file_name=download_path
                 )
                 
-                if file_path and os.path.exists(file_path):
+                # Download thumbnail
+                await client.download_media(thumbnail_file_id, file_name=thumb_path)
+                
+                if file_path and os.path.exists(file_path) and os.path.exists(thumb_path):
                     # Upload with custom thumbnail
                     sent_message = await client.send_video(
                         chat_id=message.chat.id,
                         video=file_path,
-                        thumbnail=thumbnail_file_id,  # ✅ FIXED
+                        thumb=thumb_path,  # ✅ CORRECT: Pyrogram uses 'thumb' for file path
                         caption=f"`{original_filename}`\n\n⚡ **Custom Thumbnail Applied!**",
                         duration=duration,
                         width=width,
@@ -266,9 +285,10 @@ async def instant_thumbnail_change(client, message):
                         supports_streaming=True
                     )
                     
-                    # Cleanup
+                    # Cleanup files
                     try:
                         os.remove(file_path)
+                        os.remove(thumb_path)
                     except:
                         pass
                     
@@ -512,7 +532,7 @@ async def upload_type_callback(client, callback_query):
             await client.send_document(
                 callback_query.message.chat.id,
                 document=file_path,
-                thumbnail=thumb_path,  # ✅ FIXED: thumbnail instead of thumb
+                thumb=thumb_path,  # ✅ CORRECT: Pyrogram uses 'thumb' for file path
                 caption=f"`{final_filename}`",
                 progress=progress_for_pyrogram,
                 progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
@@ -521,7 +541,7 @@ async def upload_type_callback(client, callback_query):
             await client.send_video(
                 callback_query.message.chat.id,
                 video=file_path,
-                thumbnail=thumb_path,  # ✅ FIXED: thumbnail instead of thumb
+                thumb=thumb_path,  # ✅ CORRECT: Pyrogram uses 'thumb' for file path
                 caption=f"`{final_filename}`",
                 duration=original_duration,
                 supports_streaming=True,
@@ -691,7 +711,7 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
         await client.send_document(
             message.chat.id,
             document=file_path,
-            thumbnail=thumb_path,  # ✅ FIXED: thumbnail instead of thumb
+            thumb=thumb_path,  # ✅ CORRECT: Pyrogram uses 'thumb' for file path
             caption=f"`{final_name}`",
             progress=progress_for_pyrogram,
             progress_args=("📤 **Uploading File**", progress_msg, start_time, final_name)
