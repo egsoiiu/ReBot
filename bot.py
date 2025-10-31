@@ -213,18 +213,17 @@ async def instant_thumbnail_change(client, message):
         # Show processing message
         processing_msg = await message.reply_text("⚡ Changing thumbnail instantly...")
         
-        # METHOD 1: Try using send_video with thumbnail (most reliable)
+        # METHOD 1: Try using send_video with thumbnail (CORRECTED)
         try:
             sent_message = await client.send_video(
                 chat_id=message.chat.id,
                 video=original_file_id,
-                thumb=thumbnail_file_id,
+                thumbnail=thumbnail_file_id,  # ✅ FIXED: thumbnail instead of thumb
                 caption=f"`{original_filename}`\n\n⚡ **Custom Thumbnail Applied!**",
                 duration=duration,
                 width=width,
                 height=height,
-                supports_streaming=True,
-                file_name=original_filename
+                supports_streaming=True
             )
             
             # Delete processing message
@@ -241,12 +240,12 @@ async def instant_thumbnail_change(client, message):
             )
             
         except Exception as e:
-            # If METHOD 1 fails, try METHOD 2: Edit media with custom thumbnail
+            # If METHOD 1 fails, try METHOD 2: Download and re-upload with thumbnail
             try:
                 await processing_msg.edit_text("⚡ Trying alternative method...")
                 
                 # Download the video file temporarily
-                download_path = f"downloads/{original_filename}"
+                download_path = f"downloads/{user_id}_{int(time.time())}_{original_filename}"
                 os.makedirs("downloads", exist_ok=True)
                 
                 file_path = await client.download_media(
@@ -259,7 +258,7 @@ async def instant_thumbnail_change(client, message):
                     sent_message = await client.send_video(
                         chat_id=message.chat.id,
                         video=file_path,
-                        thumb=thumbnail_file_id,
+                        thumbnail=thumbnail_file_id,  # ✅ FIXED
                         caption=f"`{original_filename}`\n\n⚡ **Custom Thumbnail Applied!**",
                         duration=duration,
                         width=width,
@@ -268,7 +267,10 @@ async def instant_thumbnail_change(client, message):
                     )
                     
                     # Cleanup
-                    os.remove(file_path)
+                    try:
+                        os.remove(file_path)
+                    except:
+                        pass
                     
                     await processing_msg.delete()
                     await message.reply_text(
@@ -283,7 +285,18 @@ async def instant_thumbnail_change(client, message):
                     raise Exception("Download failed")
                     
             except Exception as e2:
-                raise Exception(f"Both methods failed: {str(e)} | {str(e2)}")
+                # Final fallback - just send the video without thumbnail changes
+                await processing_msg.delete()
+                await message.reply_text(
+                    f"**⚠️ Could not change thumbnail, but sending original video:**\n\n"
+                    f"**Error:** `{str(e2)}`"
+                )
+                # Send original video
+                await client.send_video(
+                    chat_id=message.chat.id,
+                    video=original_file_id,
+                    caption=f"`{original_filename}` (Original)"
+                )
         
     except Exception as e:
         error_msg = f"**❌ Error:** `{str(e)}`"
@@ -499,7 +512,7 @@ async def upload_type_callback(client, callback_query):
             await client.send_document(
                 callback_query.message.chat.id,
                 document=file_path,
-                thumb=thumb_path,
+                thumbnail=thumb_path,  # ✅ FIXED: thumbnail instead of thumb
                 caption=f"`{final_filename}`",
                 progress=progress_for_pyrogram,
                 progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
@@ -508,7 +521,7 @@ async def upload_type_callback(client, callback_query):
             await client.send_video(
                 callback_query.message.chat.id,
                 video=file_path,
-                thumb=thumb_path,
+                thumbnail=thumb_path,  # ✅ FIXED: thumbnail instead of thumb
                 caption=f"`{final_filename}`",
                 duration=original_duration,
                 supports_streaming=True,
@@ -678,7 +691,7 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
         await client.send_document(
             message.chat.id,
             document=file_path,
-            thumb=thumb_path,
+            thumbnail=thumb_path,  # ✅ FIXED: thumbnail instead of thumb
             caption=f"`{final_name}`",
             progress=progress_for_pyrogram,
             progress_args=("📤 **Uploading File**", progress_msg, start_time, final_name)
