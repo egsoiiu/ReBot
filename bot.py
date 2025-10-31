@@ -112,11 +112,6 @@ def convert_seconds(seconds):
     else:
         return f"{minutes:02d}:{seconds:02d}"
 
-# Simple thumbnail processing without PIL
-async def process_thumb_async(ph_path):
-    """Simple thumbnail pass-through without PIL"""
-    pass
-
 # ========== DATABASE CLASS ==========
 class Database:
     def __init__(self, uri, database_name):
@@ -212,35 +207,90 @@ async def instant_thumbnail_change(client, message):
         original_filename = getattr(video, 'file_name', 'video.mp4')
         duration = getattr(video, 'duration', 0)
         file_size = humanbytes(getattr(video, 'file_size', 0))
+        width = getattr(video, 'width', 0)
+        height = getattr(video, 'height', 0)
         
         # Show processing message
         processing_msg = await message.reply_text("⚡ Changing thumbnail instantly...")
         
-        # INSTANT THUMBNAIL CHANGE - No downloading!
-        await client.send_video(
-            message.chat.id,
-            video=original_file_id,      # Use original video file_id
-            thumb=thumbnail_file_id,     # Use saved thumbnail file_id
-            caption=f"`{original_filename}`\n\n⚡ **Instant Thumbnail Applied!**",
-            duration=duration,
-            supports_streaming=True,
-            file_name=original_filename  # Keep original filename
-        )
-        
-        # Delete processing message
-        await processing_msg.delete()
-        
-        # Success message
-        await message.reply_text(
-            f"**✅ Thumbnail Changed Instantly!**\n\n"
-            f"**File:** `{original_filename}`\n"
-            f"**Size:** `{file_size}`\n"
-            f"**Duration:** `{convert_seconds(duration)}`\n\n"
-            f"⚡ **No download, no re-upload - instant processing!**"
-        )
+        # METHOD 1: Try using send_video with thumbnail (most reliable)
+        try:
+            sent_message = await client.send_video(
+                chat_id=message.chat.id,
+                video=original_file_id,
+                thumb=thumbnail_file_id,
+                caption=f"`{original_filename}`\n\n⚡ **Custom Thumbnail Applied!**",
+                duration=duration,
+                width=width,
+                height=height,
+                supports_streaming=True,
+                file_name=original_filename
+            )
+            
+            # Delete processing message
+            await processing_msg.delete()
+            
+            # Success message
+            await message.reply_text(
+                f"**✅ Custom Thumbnail Applied!**\n\n"
+                f"**File:** `{original_filename}`\n"
+                f"**Size:** `{file_size}`\n"
+                f"**Duration:** `{convert_seconds(duration)}`\n\n"
+                f"⚡ **New video with custom thumbnail sent!**\n"
+                f"📱 **Download this version for custom thumbnail**"
+            )
+            
+        except Exception as e:
+            # If METHOD 1 fails, try METHOD 2: Edit media with custom thumbnail
+            try:
+                await processing_msg.edit_text("⚡ Trying alternative method...")
+                
+                # Download the video file temporarily
+                download_path = f"downloads/{original_filename}"
+                os.makedirs("downloads", exist_ok=True)
+                
+                file_path = await client.download_media(
+                    video_message,
+                    file_name=download_path
+                )
+                
+                if file_path and os.path.exists(file_path):
+                    # Upload with custom thumbnail
+                    sent_message = await client.send_video(
+                        chat_id=message.chat.id,
+                        video=file_path,
+                        thumb=thumbnail_file_id,
+                        caption=f"`{original_filename}`\n\n⚡ **Custom Thumbnail Applied!**",
+                        duration=duration,
+                        width=width,
+                        height=height,
+                        supports_streaming=True
+                    )
+                    
+                    # Cleanup
+                    os.remove(file_path)
+                    
+                    await processing_msg.delete()
+                    await message.reply_text(
+                        f"**✅ Custom Thumbnail Applied!**\n\n"
+                        f"**File:** `{original_filename}`\n"
+                        f"**Size:** `{file_size}`\n"
+                        f"**Duration:** `{convert_seconds(duration)}`\n\n"
+                        f"⚡ **Alternative method used**\n"
+                        f"📱 **Download this version for custom thumbnail**"
+                    )
+                else:
+                    raise Exception("Download failed")
+                    
+            except Exception as e2:
+                raise Exception(f"Both methods failed: {str(e)} | {str(e2)}")
         
     except Exception as e:
         error_msg = f"**❌ Error:** `{str(e)}`"
+        try:
+            await processing_msg.delete()
+        except:
+            pass
         await message.reply_text(error_msg)
         logging.error(f"Instant thumbnail error: {e}")
 
@@ -268,7 +318,7 @@ async def start_command(client, message):
         "• Send a photo to set thumbnail\n"
         "• /view_thumb - View current thumbnail\n"
         "• /del_thumb - Delete thumbnail\n"
-        "• /changethumbinstant - Instantly change thumbnail of replied video\n\n"
+        "• /changethumbinstant - Instantly apply custom thumbnail to replied video\n\n"
         "**Other Commands:**\n"
         "• /cancel - Cancel current process"
     )
@@ -329,7 +379,6 @@ async def handle_file(client, message):
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Rename", callback_data="start_rename")]
-        # Removed cancel button
     ])
     
     await message.reply_text(info_text, reply_markup=keyboard)
@@ -578,7 +627,6 @@ async def handle_filename(client, message):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📄 Document", callback_data="upload_document")],
         [InlineKeyboardButton("🎥 Video", callback_data="upload_video")]
-        # Removed cancel button
     ])
     
     await message.reply_text(
