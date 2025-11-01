@@ -11,7 +11,6 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import QueryIdInvalid, MessageNotModified
 import motor.motor_asyncio
 
-# ========== CONFIG ==========
 class Config:
     API_ID = int(os.environ.get("API_ID", 0))
     API_HASH = os.environ.get("API_HASH", "")
@@ -19,7 +18,6 @@ class Config:
     DB_URL = os.environ.get("DB_URL", "")
     DB_NAME = "RenameBot"
 
-# ========== SIMPLE HTTP SERVER FOR RENDER PORT ==========
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -35,15 +33,13 @@ def run_health_server():
     print("🌐 Health check server running on port 8080")
     server.serve_forever()
 
-# Start health server in background
 health_thread = threading.Thread(target=run_health_server, daemon=True)
 health_thread.start()
 
-# ========== UTILITY FUNCTIONS ==========
 async def progress_for_pyrogram(current, total, ud_type, message, start, filename):
     now = time.time()
     diff = now - start
-    if round(diff % 2.00) == 0 or current == total:  # Update every 2 seconds
+    if round(diff % 2.00) == 0 or current == total:
         percentage = current * 100 / total
         speed = current / diff if diff > 0 else 0
         elapsed_time = round(diff) * 1000
@@ -53,7 +49,6 @@ async def progress_for_pyrogram(current, total, ud_type, message, start, filenam
         elapsed_time = TimeFormatter(milliseconds=elapsed_time)
         estimated_total_time = TimeFormatter(milliseconds=estimated_total_time)
 
-        # Progress bar with 10 blocks
         filled_blocks = math.floor(percentage / 10)
         empty_blocks = 10 - filled_blocks
         progress_bar = "▣" * filled_blocks + "□" * empty_blocks
@@ -102,7 +97,6 @@ def TimeFormatter(milliseconds: int) -> str:
         return f"{seconds}s"
 
 def convert_seconds(seconds):
-    """Convert seconds to MM:SS or HH:MM:SS format"""
     seconds = int(seconds)
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
@@ -112,12 +106,9 @@ def convert_seconds(seconds):
     else:
         return f"{minutes:02d}:{seconds:02d}"
 
-# Simple thumbnail processing without PIL
 async def process_thumb_async(ph_path):
-    """Simple thumbnail pass-through without PIL"""
     pass
 
-# ========== DATABASE CLASS ==========
 class Database:
     def __init__(self, uri, database_name):
         self._client = motor.motor_asyncio.AsyncIOMotorClient(uri)
@@ -135,10 +126,8 @@ class Database:
         user = await self.col.find_one({"_id": user_id})
         return user.get("file_id") if user else None
 
-# Initialize database
 db = Database(Config.DB_URL, Config.DB_NAME)
 
-# ========== BOT SETUP ==========
 if not all([Config.API_ID, Config.API_HASH, Config.BOT_TOKEN]):
     print("❌ ERROR: Missing API credentials! Please set environment variables.")
     print(f"API_ID: {'✅' if Config.API_ID else '❌'}")
@@ -153,10 +142,8 @@ app = Client(
     bot_token=Config.BOT_TOKEN
 )
 
-# ========== GLOBAL VARIABLES ==========
 user_states = {}
 
-# ========== THUMBNAIL MANAGEMENT ==========
 @app.on_message(filters.private & filters.command(["view_thumb", "viewthumbnail"]))
 async def view_thumbnail(client, message):
     thumbnail = await db.get_thumbnail(message.from_user.id)
@@ -175,7 +162,164 @@ async def save_thumbnail(client, message):
     await db.set_thumbnail(message.from_user.id, message.photo.file_id)
     await message.reply_text("**Thumbnail saved successfully!**")
 
-# ========== CANCEL COMMAND ==========
+@app.on_message(filters.private & filters.command("cover"))
+async def cover_command(client, message):
+    user_id = message.from_user.id
+    
+    if not message.reply_to_message:
+        await message.reply_text("**❌ Please reply /cover to a video message!**")
+        return
+    
+    replied_message = message.reply_to_message
+    
+    if not replied_message.video:
+        await message.reply_text("**❌ Please reply to a video file!**")
+        return
+    
+    thumbnail = await db.get_thumbnail(user_id)
+    if not thumbnail:
+        await message.reply_text("**❌ No thumbnail found in database!**")
+        return
+    
+    try:
+        video = replied_message.video
+        video_file_id = video.file_id
+        video_file_name = getattr(video, 'file_name', 'video.mp4')
+        video_duration = getattr(video, 'duration', 0)
+        
+        progress_msg = await message.reply_text("🔄 Applying cover to video...")
+        
+        download_path = f"downloads/cover_{user_id}_{video_file_id}.mp4"
+        os.makedirs("downloads", exist_ok=True)
+        
+        start_time = time.time()
+        file_path = await client.download_media(
+            replied_message,
+            file_name=download_path,
+            progress=progress_for_pyrogram,
+            progress_args=("📥 **Downloading Video**", progress_msg, start_time, video_file_name)
+        )
+        
+        if not file_path or not os.path.exists(file_path):
+            raise Exception("Video download failed")
+        
+        thumb_path = f"downloads/thumb_{user_id}.jpg"
+        thumb_path = await client.download_media(thumbnail, file_name=thumb_path)
+        
+        start_time = time.time()
+        
+        await client.send_video(
+            chat_id=message.chat.id,
+            video=file_path,
+            thumb=thumb_path,
+            caption=f"**🎥 Video with Custom Cover**\n`{video_file_name}`",
+            duration=video_duration,
+            supports_streaming=True,
+            progress=progress_for_pyrogram,
+            progress_args=("📤 **Uploading Video with Cover**", progress_msg, start_time, video_file_name)
+        )
+        
+        await message.reply_text("**✅ Video Cover Applied Successfully!**")
+        
+        try:
+            await progress_msg.delete()
+        except:
+            pass
+            
+    except Exception as e:
+        error_msg = f"**❌ Error applying cover:** `{str(e)}`"
+        await message.reply_text(error_msg)
+        logging.error(f"Cover error: {e}")
+    
+    finally:
+        if 'file_path' in locals() and file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except:
+                pass
+        if 'thumb_path' in locals() and thumb_path and os.path.exists(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except:
+                pass
+
+@app.on_message(filters.private & filters.command("cover2"))
+async def cover_command_advanced(client, message):
+    user_id = message.from_user.id
+    
+    if not message.reply_to_message:
+        await message.reply_text("**❌ Please reply /cover2 to a video message!**")
+        return
+    
+    replied_message = message.reply_to_message
+    
+    if not replied_message.video:
+        await message.reply_text("**❌ Please reply to a video file!**")
+        return
+    
+    thumbnail = await db.get_thumbnail(user_id)
+    if not thumbnail:
+        await message.reply_text("**❌ No thumbnail found in database!**")
+        return
+    
+    try:
+        video = replied_message.video
+        video_file_id = video.file_id
+        
+        thumb_path = f"downloads/thumb_adv_{user_id}.jpg"
+        thumb_path = await client.download_media(thumbnail, file_name=thumb_path)
+        
+        progress_msg = await message.reply_text("🔄 Applying cover (advanced method)...")
+        
+        await client.send_video(
+            chat_id=message.chat.id,
+            video=video_file_id,
+            thumb=thumb_path,
+            caption="**🎥 Video with Custom Cover**\n(Advanced Method)",
+            duration=video.duration,
+            supports_streaming=True
+        )
+        
+        await message.reply_text("**✅ Advanced cover applied!**")
+        
+        try:
+            await progress_msg.delete()
+        except:
+            pass
+        
+    except Exception as e:
+        await message.reply_text(f"**❌ Advanced cover error:** `{str(e)}`")
+        logging.error(f"Advanced cover error: {e}")
+    
+    finally:
+        if 'thumb_path' in locals() and thumb_path and os.path.exists(thumb_path):
+            try:
+                os.remove(thumb_path)
+            except:
+                pass
+
+@app.on_message(filters.private & filters.command("cover_help"))
+async def cover_help(client, message):
+    help_text = """
+**🎥 Video Cover Commands:**
+
+**/cover** - Apply your thumbnail as video cover
+• Reply to a video with `/cover`
+• Uses thumbnail from your database
+• Creates new video with custom cover
+
+**/cover2** - Advanced cover feature
+• Alternative method using file_id
+• Faster for some videos
+
+**How to use:**
+1. First set a thumbnail by sending a photo
+2. Send or forward a video to me
+3. Reply to the video with `/cover`
+4. I'll send back the video with your custom cover
+"""
+    await message.reply_text(help_text)
+
 @app.on_message(filters.private & filters.command("cancel"))
 async def cancel_command(client, message):
     user_id = message.from_user.id
@@ -185,7 +329,6 @@ async def cancel_command(client, message):
     else:
         await message.reply_text("**❌ No active process to cancel.**")
 
-# ========== START COMMAND ==========
 @app.on_message(filters.private & filters.command("start"))
 async def start_command(client, message):
     await message.reply_text(
@@ -195,25 +338,26 @@ async def start_command(client, message):
         "2. Click 'Rename' button\n"
         "3. Enter new filename\n"
         "4. Select upload type\n\n"
+        "**🎥 Video Cover Feature:**\n"
+        "• Set thumbnail by sending a photo\n"
+        "• Reply /cover to any video to apply cover\n\n"
         "**Thumbnail Commands:**\n"
         "• Send a photo to set thumbnail\n"
         "• /view_thumb - View current thumbnail\n"
-        "• /del_thumb - Delete thumbnail\n\n"
+        "• /del_thumb - Delete thumbnail\n"
+        "• /cover_help - Video cover help\n\n"
         "**Other Commands:**\n"
         "• /cancel - Cancel current process"
     )
 
-# ========== FILE RENAME HANDLER ==========
 @app.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def handle_file(client, message):
     user_id = message.from_user.id
     
-    # Block if user already has active process
     if user_id in user_states:
         await message.reply_text("**❌ Please complete your current process first!**\nUse /cancel to cancel.")
         return
     
-    # Get file info
     if message.document:
         file = message.document
         file_type = "document"
@@ -232,7 +376,6 @@ async def handle_file(client, message):
     file_name = getattr(file, 'file_name', 'Unknown')
     file_size = humanbytes(getattr(file, 'file_size', 0))
     
-    # Store file info with duration
     user_states[user_id] = {
         'file_info': {
             'file_name': file_name,
@@ -245,7 +388,6 @@ async def handle_file(client, message):
         'step': 'awaiting_rename'
     }
 
-    # Show file info with buttons - include duration
     duration_text = convert_seconds(duration) if duration > 0 else "Not available"
     
     info_text = f"""**📁 File Information:**
@@ -259,12 +401,10 @@ async def handle_file(client, message):
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Rename", callback_data="start_rename")]
-        # Removed cancel button
     ])
     
     await message.reply_text(info_text, reply_markup=keyboard)
 
-# ========== CALLBACK HANDLERS ==========
 @app.on_callback_query(filters.regex("^start_rename$"))
 async def start_rename_callback(client, callback_query):
     user_id = callback_query.from_user.id
@@ -275,13 +415,11 @@ async def start_rename_callback(client, callback_query):
     
     user_states[user_id]['step'] = 'awaiting_filename'
     
-    # Delete the rename prompt message
     try:
         await callback_query.message.delete()
     except:
         pass
     
-    # Ask for filename directly without buttons
     ask_msg = await callback_query.message.reply_text(
         "**📝 Please reply with the new filename:**\n\n"
         "**Note:** Don't include file extension\n"
@@ -289,7 +427,6 @@ async def start_rename_callback(client, callback_query):
         "💡 *You can reply to this message*"
     )
     
-    # Store the ask message ID for auto-reply
     user_states[user_id]['ask_message_id'] = ask_msg.id
     
     await callback_query.answer()
@@ -306,7 +443,6 @@ async def upload_type_callback(client, callback_query):
     user_data = user_states[user_id]
     
     try:
-        # Delete the selection message
         try:
             await callback_query.message.delete()
         except:
@@ -317,7 +453,6 @@ async def upload_type_callback(client, callback_query):
         original_message = file_info['original_message']
         original_duration = file_info['duration']
         
-        # Get original extension
         original_name = file_info['file_name']
         if not original_name or original_name == 'Unknown':
             if file_info['file_type'] == 'video':
@@ -338,14 +473,11 @@ async def upload_type_callback(client, callback_query):
         
         final_filename = f"{new_filename}{original_ext}"
         
-        # Download path
         download_path = f"downloads/{final_filename}"
         os.makedirs("downloads", exist_ok=True)
         
-        # Create progress message
         progress_msg = await callback_query.message.reply_text("🔄 Processing your file...")
         
-        # Download file with progress
         start_time = time.time()
         
         file_path = await client.download_media(
@@ -358,7 +490,6 @@ async def upload_type_callback(client, callback_query):
         if not file_path or not os.path.exists(file_path):
             raise Exception("Download failed")
         
-        # Get thumbnail
         thumbnail = await db.get_thumbnail(user_id)
         thumb_path = None
         if thumbnail:
@@ -367,10 +498,8 @@ async def upload_type_callback(client, callback_query):
             except:
                 pass
         
-        # Upload file with progress (no separate "Uploading" message)
         start_time = time.time()
         
-        # Check if file should be forced as document
         force_document = False
         if original_ext.lower() in ['.pdf', '.html', '.htm', '.txt', '.doc', '.docx']:
             force_document = True
@@ -385,7 +514,7 @@ async def upload_type_callback(client, callback_query):
                 progress=progress_for_pyrogram,
                 progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
             )
-        else:  # video
+        else:
             await client.send_video(
                 callback_query.message.chat.id,
                 video=file_path,
@@ -397,7 +526,6 @@ async def upload_type_callback(client, callback_query):
                 progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
             )
         
-        # Success message
         duration_text = convert_seconds(original_duration) if original_duration > 0 else "Unknown"
         await callback_query.message.reply_text(
             f"**✅ File Renamed Successfully!**\n\n"
@@ -406,7 +534,6 @@ async def upload_type_callback(client, callback_query):
             f"**Duration:** `{duration_text}`"
         )
         
-        # Cleanup progress message
         try:
             await progress_msg.delete()
         except:
@@ -418,7 +545,6 @@ async def upload_type_callback(client, callback_query):
         logging.error(f"Upload error: {e}")
     
     finally:
-        # Cleanup files
         if 'file_path' in locals() and file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -430,12 +556,10 @@ async def upload_type_callback(client, callback_query):
             except:
                 pass
         
-        # Clear user state
         if user_id in user_states:
             del user_states[user_id]
 
-# ========== FILENAME INPUT HANDLER ==========
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "cover", "cover2", "cover_help"]))
 async def handle_filename(client, message):
     user_id = message.from_user.id
     
@@ -453,7 +577,6 @@ async def handle_filename(client, message):
         await message.reply_text("**❌ Filename cannot be empty!**")
         return
     
-    # Clean filename
     clean_name = re.sub(r'[<>:"/\\|?*]', '', new_name)
     
     if not clean_name:
@@ -463,7 +586,6 @@ async def handle_filename(client, message):
     user_states[user_id]['new_filename'] = clean_name
     user_states[user_id]['step'] = 'awaiting_upload_type'
     
-    # Delete the user's filename message and the ask message
     try:
         await message.delete()
     except:
@@ -475,7 +597,6 @@ async def handle_filename(client, message):
     except:
         pass
     
-    # Show upload type selection
     original_name = user_data['file_info']['file_name']
     if not original_name or original_name == 'Unknown':
         file_type = user_data['file_info']['file_type']
@@ -498,9 +619,7 @@ async def handle_filename(client, message):
     
     final_name = f"{clean_name}{original_ext}"
     
-    # Auto-select document for specific file types
     if original_ext.lower() in ['.pdf', '.html', '.htm', '.txt', '.doc', '.docx']:
-        # Auto-upload as document without asking
         user_states[user_id]['step'] = 'processing'
         await handle_auto_upload(client, message, user_id, final_name, "document")
         return
@@ -508,7 +627,6 @@ async def handle_filename(client, message):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📄 Document", callback_data="upload_document")],
         [InlineKeyboardButton("🎥 Video", callback_data="upload_video")]
-        # Removed cancel button
     ])
     
     await message.reply_text(
@@ -517,7 +635,6 @@ async def handle_filename(client, message):
     )
 
 async def handle_auto_upload(client, message, user_id, final_name, upload_type):
-    """Handle automatic upload for document files"""
     user_data = user_states[user_id]
     
     try:
@@ -525,14 +642,11 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
         original_message = file_info['original_message']
         original_duration = file_info['duration']
         
-        # Download path
         download_path = f"downloads/{final_name}"
         os.makedirs("downloads", exist_ok=True)
         
-        # Create progress message
         progress_msg = await message.reply_text("🔄 Processing your file...")
         
-        # Download file with progress
         start_time = time.time()
         
         file_path = await client.download_media(
@@ -545,7 +659,6 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
         if not file_path or not os.path.exists(file_path):
             raise Exception("Download failed")
         
-        # Get thumbnail
         thumbnail = await db.get_thumbnail(user_id)
         thumb_path = None
         if thumbnail:
@@ -554,7 +667,6 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
             except:
                 pass
         
-        # Upload file with progress
         start_time = time.time()
         
         await client.send_document(
@@ -566,14 +678,12 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
             progress_args=("📤 **Uploading File**", progress_msg, start_time, final_name)
         )
         
-        # Success message
         await message.reply_text(
             f"**✅ File Renamed Successfully!**\n\n"
             f"**New Name:** `{final_name}`\n"
             f"**Type:** `Document`"
         )
         
-        # Cleanup progress message
         try:
             await progress_msg.delete()
         except:
@@ -585,7 +695,6 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
         logging.error(f"Upload error: {e}")
     
     finally:
-        # Cleanup files
         if 'file_path' in locals() and file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -597,11 +706,9 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
             except:
                 pass
         
-        # Clear user state
         if user_id in user_states:
             del user_states[user_id]
 
-# ========== START BOT ==========
 if __name__ == "__main__":
     print("🚀 Bot is starting...")
     print("🌐 Health check server running on port 8080")
