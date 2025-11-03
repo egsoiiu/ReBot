@@ -38,7 +38,7 @@ health_thread = threading.Thread(target=run_health_server, daemon=True)
 health_thread.start()
 
 # ========== UTILITY FUNCTIONS ==========
-async def progress_for_pyrogram(current, total, ud_type, message, start, filename, user_id):
+async def progress_for_pyrogram(current, total, ud_type, message, start, filename):
     now = time.time()
     diff = now - start
     if round(diff % 2.00) == 0 or current == total:
@@ -66,14 +66,8 @@ async def progress_for_pyrogram(current, total, ud_type, message, start, filenam
 
 ⏰ **ETA:** {estimated_total_time if estimated_total_time != '' else '0s'}
 """
-        
-        # Add cancel button to progress
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_progress_{user_id}")]
-        ])
-        
         try:
-            await message.edit(text=progress_text, reply_markup=keyboard)
+            await message.edit(text=progress_text)
         except:
             pass
 
@@ -164,8 +158,7 @@ app = Client("rename_bot", api_id=Config.API_ID, api_hash=Config.API_HASH, bot_t
 
 # ========== GLOBAL VARIABLES ==========
 user_states = {}
-active_downloads = {}
-active_uploads = {}
+cancellation_flags = {}
 
 # ========== ACCESS CONTROL ==========
 def private_access(func):
@@ -179,11 +172,7 @@ def private_access(func):
         if await db.is_allowed_user(user_id):
             return await func(client, message)
         else:
-            # Only send one access denied message
-            if user_id not in user_states or user_states.get(user_id, {}).get('access_denied_sent') != True:
-                await message.reply_text("🚫 **This bot is in private mode. Contact owner for access.**")
-                if user_id in user_states:
-                    user_states[user_id]['access_denied_sent'] = True
+            await message.reply_text("🚫 **This bot is in private mode. Contact owner for access.**")
             return
     return wrapper
 
@@ -202,7 +191,10 @@ async def start_command(client, message):
     user_id = message.from_user.id
     private_mode = await db.get_private_mode()
     
-    if private_mode and not await db.is_allowed_user(user_id):
+    # Check if user is allowed (owner or allowed user)
+    is_allowed = await db.is_allowed_user(user_id)
+    
+    if private_mode and not is_allowed:
         await message.reply_text("🚫 **This bot is in private mode. Contact owner for access.**")
         return
     
@@ -287,13 +279,8 @@ async def mode_command(client, message):
 async def cancel_command(client, message):
     user_id = message.from_user.id
     
-    # Cancel active downloads
-    if user_id in active_downloads:
-        active_downloads[user_id] = True
-    
-    # Cancel active uploads  
-    if user_id in active_uploads:
-        active_uploads[user_id] = True
+    # Set cancellation flag
+    cancellation_flags[user_id] = True
     
     # Cleanup files and state
     if user_id in user_states:
@@ -313,8 +300,8 @@ async def cancel_command(client, message):
     await message.reply_text("✅ **Process cancelled successfully!**")
 
 # ========== CANCEL CALLBACK HANDLERS ==========
-@app.on_callback_query(filters.regex(r"^cancel_progress_(\d+)$"))
-async def cancel_progress_handler(client, callback_query):
+@app.on_callback_query(filters.regex(r"^cancel_confirm_(\d+)$"))
+async def cancel_confirm_handler(client, callback_query):
     user_id = callback_query.from_user.id
     target_user_id = int(callback_query.matches[0].group(1))
     
@@ -322,10 +309,10 @@ async def cancel_progress_handler(client, callback_query):
         await callback_query.answer("❌ You can only cancel your own processes!", show_alert=True)
         return
     
-    # Show confirmation
+    # Show confirmation buttons
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Yes, Cancel", callback_data=f"confirm_cancel_{user_id}")],
-        [InlineKeyboardButton("❌ No, Continue", callback_data=f"deny_cancel_{user_id}")]
+        [InlineKeyboardButton("✅ Yes, Cancel", callback_data=f"cancel_yes_{user_id}")],
+        [InlineKeyboardButton("❌ No, Continue", callback_data=f"cancel_no_{user_id}")]
     ])
     
     try:
@@ -334,8 +321,8 @@ async def cancel_progress_handler(client, callback_query):
     except:
         await callback_query.answer("Error updating message", show_alert=True)
 
-@app.on_callback_query(filters.regex(r"^confirm_cancel_(\d+)$"))
-async def confirm_cancel_handler(client, callback_query):
+@app.on_callback_query(filters.regex(r"^cancel_yes_(\d+)$"))
+async def cancel_yes_handler(client, callback_query):
     user_id = callback_query.from_user.id
     target_user_id = int(callback_query.matches[0].group(1))
     
@@ -343,13 +330,10 @@ async def confirm_cancel_handler(client, callback_query):
         await callback_query.answer("❌ Access denied!", show_alert=True)
         return
     
-    # Cancel active processes
-    if user_id in active_downloads:
-        active_downloads[user_id] = True
-    if user_id in active_uploads:
-        active_uploads[user_id] = True
+    # Set cancellation flag
+    cancellation_flags[user_id] = True
     
-    # Cleanup
+    # Cleanup files and state
     if user_id in user_states:
         user_data = user_states[user_id]
         if user_data.get('file_path') and os.path.exists(user_data['file_path']):
@@ -363,8 +347,8 @@ async def confirm_cancel_handler(client, callback_query):
     await callback_query.message.edit_text("✅ **Process cancelled successfully!**")
     await callback_query.answer()
 
-@app.on_callback_query(filters.regex(r"^deny_cancel_(\d+)$"))
-async def deny_cancel_handler(client, callback_query):
+@app.on_callback_query(filters.regex(r"^cancel_no_(\d+)$"))
+async def cancel_no_handler(client, callback_query):
     user_id = callback_query.from_user.id
     target_user_id = int(callback_query.matches[0].group(1))
     
@@ -372,15 +356,13 @@ async def deny_cancel_handler(client, callback_query):
         await callback_query.answer("❌ Access denied!", show_alert=True)
         return
     
-    # Clear cancellation flags
-    if user_id in active_downloads:
-        del active_downloads[user_id]
-    if user_id in active_uploads:
-        del active_uploads[user_id]
+    # Clear cancellation flag
+    if user_id in cancellation_flags:
+        del cancellation_flags[user_id]
     
-    # Restore cancel button
+    # Restore original cancel button
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_progress_{user_id}")]
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_confirm_{user_id}")]
     ])
     
     try:
@@ -425,11 +407,9 @@ async def handle_file(client, message):
         await message.reply_text("❌ **Please complete your current process first!**\nUse /cancel to cancel.")
         return
     
-    # Clear any active cancellation flags
-    if user_id in active_downloads:
-        del active_downloads[user_id]
-    if user_id in active_uploads:
-        del active_uploads[user_id]
+    # Clear cancellation flag
+    if user_id in cancellation_flags:
+        del cancellation_flags[user_id]
     
     # Get file info
     if message.document:
@@ -459,8 +439,7 @@ async def handle_file(client, message):
             'original_message': message,
             'file_id': file.file_id
         },
-        'step': 'awaiting_rename',
-        'access_denied_sent': False
+        'step': 'awaiting_rename'
     }
 
     duration_text = convert_seconds(duration) if duration > 0 else "N/A"
@@ -544,29 +523,30 @@ async def upload_type_callback(client, callback_query):
         download_path = f"downloads/{final_filename}"
         os.makedirs("downloads", exist_ok=True)
         
-        progress_msg = await callback_query.message.reply_text("🔄 **Processing your file...**")
-        start_time = time.time()
+        # Create progress message with cancel button
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_confirm_{user_id}")]
+        ])
+        progress_msg = await callback_query.message.reply_text("🔄 **Processing your file...**", reply_markup=keyboard)
         
-        # Set active download flag
-        active_downloads[user_id] = False
+        start_time = time.time()
         
         # Download with progress
         file_path = await client.download_media(
             original_message,
             file_name=download_path,
             progress=progress_for_pyrogram,
-            progress_args=("📥 **Downloading File**", progress_msg, start_time, final_filename, user_id)
+            progress_args=("📥 **Downloading File**", progress_msg, start_time, final_filename)
         )
         
         # Check if download was cancelled
-        if user_id in active_downloads and active_downloads[user_id]:
+        if user_id in cancellation_flags and cancellation_flags[user_id]:
             await progress_msg.edit_text("✅ **Download cancelled!**")
             if file_path and os.path.exists(file_path):
                 try: os.remove(file_path)
                 except: pass
             if user_id in user_states: del user_states[user_id]
-            if user_id in active_downloads: del active_downloads[user_id]
-            if user_id in active_uploads: del active_uploads[user_id]
+            if user_id in cancellation_flags: del cancellation_flags[user_id]
             return
         
         if not file_path or not os.path.exists(file_path):
@@ -584,8 +564,12 @@ async def upload_type_callback(client, callback_query):
             except:
                 pass
         
-        # Set active upload flag
-        active_uploads[user_id] = False
+        # Update progress message for upload
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_confirm_{user_id}")]
+        ])
+        await progress_msg.edit_text("🔄 **Uploading file...**", reply_markup=keyboard)
+        
         start_time = time.time()
         
         if upload_type == "document" or original_ext.lower() in ['.pdf', '.txt', '.doc', '.docx']:
@@ -595,7 +579,7 @@ async def upload_type_callback(client, callback_query):
                 thumb=thumb_path,
                 caption=f"`{final_filename}`",
                 progress=progress_for_pyrogram,
-                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename, user_id)
+                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
             )
         else:
             await client.send_video(
@@ -606,11 +590,11 @@ async def upload_type_callback(client, callback_query):
                 duration=original_duration,
                 supports_streaming=True,
                 progress=progress_for_pyrogram,
-                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename, user_id)
+                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
             )
         
         # Check if upload was cancelled
-        if user_id in active_uploads and active_uploads[user_id]:
+        if user_id in cancellation_flags and cancellation_flags[user_id]:
             await progress_msg.edit_text("✅ **Upload cancelled!**")
             return
         
@@ -636,11 +620,9 @@ async def upload_type_callback(client, callback_query):
                 except: pass
             del user_states[user_id]
         
-        # Clear active flags
-        if user_id in active_downloads:
-            del active_downloads[user_id]
-        if user_id in active_uploads:
-            del active_uploads[user_id]
+        # Clear cancellation flag
+        if user_id in cancellation_flags:
+            del cancellation_flags[user_id]
 
 # ========== FILENAME HANDLER ==========
 @app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "addalloweduser", "removealloweduser", "allowedusers", "users", "mode"]))
