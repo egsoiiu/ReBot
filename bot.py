@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import QueryIdInvalid, MessageNotModified
+from pyrogram.errors import QueryIdInvalid, MessageNotModified, ChatAdminRequired
 import motor.motor_asyncio
 
 # ========== CONFIG ==========
@@ -40,7 +40,7 @@ health_thread = threading.Thread(target=run_health_server, daemon=True)
 health_thread.start()
 
 # ========== UTILITY FUNCTIONS ==========
-async def progress_for_pyrogram(current, total, ud_type, message, start, filename):
+async def progress_for_pyrogram(current, total, ud_type, message, start, filename, user_id):
     now = time.time()
     diff = now - start
     if round(diff % 2.00) == 0 or current == total:
@@ -68,8 +68,14 @@ async def progress_for_pyrogram(current, total, ud_type, message, start, filenam
 
 ⏰ **ETA:** {estimated_total_time if estimated_total_time != '' else '0s'}
 """
+        
+        # Add cancel button to progress
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_confirm_{user_id}")]
+        ])
+        
         try:
-            await message.edit(text=progress_text)
+            await message.edit(text=progress_text, reply_markup=keyboard)
         except:
             pass
 
@@ -152,6 +158,13 @@ class Database:
     async def set_private_mode(self, value):
         await self.settings.update_one({"_id": "private_mode"}, {"$set": {"value": value}}, upsert=True)
 
+    async def set_dump_channel(self, channel_id):
+        await self.settings.update_one({"_id": "dump_channel"}, {"$set": {"value": channel_id}}, upsert=True)
+
+    async def get_dump_channel(self):
+        setting = await self.settings.find_one({"_id": "dump_channel"})
+        return setting.get("value") if setting else None
+
 # Initialize database
 db = Database(Config.DB_URL, Config.DB_NAME)
 
@@ -165,23 +178,27 @@ cancellation_flags = {}
 # ========== DUMP CHANNEL FUNCTION ==========
 async def send_to_dump_channel(client, file_path, final_filename, user_id, file_type, original_duration, thumb_path=None):
     """Send file to dump channel"""
-    if not Config.DUMP_CHANNEL:
+    dump_channel = await db.get_dump_channel()
+    if not dump_channel:
         return
     
     try:
+        # Create clickable user ID
+        user_mention = f"[{user_id}](tg://user?id={user_id})"
+        
         # Prepare caption for dump channel
-        caption = f"**File Name:** `{final_filename}`\n**User ID:** `{user_id}`\n**Type:** `{file_type}`"
+        caption = f"**📁 File Name:** `{final_filename}`\n**👤 User ID:** {user_mention}\n**📊 Type:** `{file_type}`"
         
         if file_type == "document":
             await client.send_document(
-                Config.DUMP_CHANNEL,
+                dump_channel,
                 document=file_path,
                 caption=caption,
                 thumb=thumb_path
             )
         elif file_type == "video":
             await client.send_video(
-                Config.DUMP_CHANNEL,
+                dump_channel,
                 video=file_path,
                 caption=caption,
                 duration=original_duration,
@@ -190,7 +207,7 @@ async def send_to_dump_channel(client, file_path, final_filename, user_id, file_
             )
         elif file_type == "audio":
             await client.send_audio(
-                Config.DUMP_CHANNEL,
+                dump_channel,
                 audio=file_path,
                 caption=caption,
                 thumb=thumb_path
@@ -200,6 +217,46 @@ async def send_to_dump_channel(client, file_path, final_filename, user_id, file_
         
     except Exception as e:
         print(f"❌ Error dumping to channel: {e}")
+
+async def send_new_user_notification(client, user_id, first_name, username):
+    """Send notification when new user starts the bot"""
+    dump_channel = await db.get_dump_channel()
+    if not dump_channel:
+        return
+    
+    try:
+        # Create clickable user ID
+        user_mention = f"[{user_id}](tg://user?id={user_id})"
+        
+        # Prepare user info
+        username_text = f"@{username}" if username else "No username"
+        
+        notification_text = f"""**🆕 New User Started Bot**
+
+**👤 User Info:**
+**Name:** {first_name}
+**Username:** {username_text}
+**User ID:** {user_mention}
+**Time:** {time.strftime('%Y-%m-%d %H:%M:%S')}
+
+**💬 [Click to Message User](tg://user?id={user_id})**"""
+        
+        await client.send_message(
+            dump_channel,
+            notification_text
+        )
+        
+    except Exception as e:
+        print(f"❌ Error sending new user notification: {e}")
+
+async def check_bot_admin(client, chat_id):
+    """Check if bot is admin in the channel"""
+    try:
+        chat = await client.get_chat(chat_id)
+        member = await client.get_chat_member(chat_id, "me")
+        return member.privileges.can_post_messages if member.privileges else False
+    except:
+        return False
 
 # ========== ACCESS CONTROL ==========
 def private_access(func):
@@ -239,16 +296,107 @@ async def start_command(client, message):
         await message.reply_text("🚫 **This bot is in private mode. Contact owner for access.**")
         return
     
+    # Send new user notification to dump channel
+    if not await db.is_allowed_user(user_id):  # Only for new users
+        await send_new_user_notification(
+            client, 
+            user_id, 
+            message.from_user.first_name, 
+            message.from_user.username
+        )
+        # Add user to database
+        await db.col.update_one({"_id": user_id}, {"$set": {"first_seen": time.time()}}, upsert=True)
+    
     is_owner = user_id in Config.OWNER_IDS
     
     text = "👋 **File Rename Bot**\n\nSend any file to rename it.\n\n**Commands:**\n• /view_thumb - View thumbnail\n• /del_thumb - Delete thumbnail\n• /cancel - Cancel process"
     
     if is_owner:
         mode = "PRIVATE" if private_mode else "PUBLIC"
-        dump_status = "✅ ENABLED" if Config.DUMP_CHANNEL else "❌ DISABLED"
-        text += f"\n\n**Owner Commands:**\n• /addalloweduser ID\n• /removealloweduser ID\n• /allowedusers\n• /users\n• /mode private|public\n• **Mode:** {mode}\n• **Dump Channel:** {dump_status}"
+        dump_channel = await db.get_dump_channel()
+        dump_status = f"`{dump_channel}`" if dump_channel else "❌ DISABLED"
+        text += f"\n\n**Owner Commands:**\n• /addalloweduser ID\n• /removealloweduser ID\n• /allowedusers\n• /users\n• /mode private|public\n• /setdumpchannel - Set dump channel\n• **Mode:** {mode}\n• **Dump Channel:** {dump_status}"
     
     await message.reply_text(text)
+
+@app.on_message(filters.private & filters.command("setdumpchannel"))
+@main_owner_only
+async def set_dump_channel_command(client, message):
+    user_id = message.from_user.id
+    
+    if len(message.command) < 2:
+        current_channel = await db.get_dump_channel()
+        if current_channel:
+            # Check if bot is admin
+            is_admin = await check_bot_admin(client, current_channel)
+            admin_status = "✅ Admin" if is_admin else "❌ Not Admin"
+            
+            await message.reply_text(
+                f"**Current Dump Channel:** `{current_channel}`\n"
+                f"**Bot Status:** {admin_status}\n\n"
+                "**To set new channel:**\n"
+                "1. Add bot as admin to your channel\n"
+                "2. Send any media from that channel to this bot\n"
+                "3. Reply to that media with `/setdumpchannel`\n\n"
+                "**To disable:** `/setdumpchannel off`"
+            )
+        else:
+            await message.reply_text(
+                "**No dump channel set.**\n\n"
+                "**To set channel:**\n"
+                "1. Add bot as admin to your channel\n"
+                "2. Send any media from that channel to this bot\n"
+                "3. Reply to that media with `/setdumpchannel`"
+            )
+        return
+    
+    if message.reply_to_message:
+        # Get channel info from replied message
+        replied_msg = message.reply_to_message
+        if replied_msg.forward_from_chat:
+            channel_id = replied_msg.forward_from_chat.id
+            channel_title = replied_msg.forward_from_chat.title
+            
+            # Check if bot is admin in that channel
+            is_admin = await check_bot_admin(client, channel_id)
+            
+            if is_admin:
+                await db.set_dump_channel(channel_id)
+                await message.reply_text(
+                    f"✅ **Dump channel set successfully!**\n\n"
+                    f"**Channel:** {channel_title}\n"
+                    f"**ID:** `{channel_id}`\n"
+                    f"**Status:** ✅ Bot is admin\n\n"
+                    f"All files will now be saved to this channel."
+                )
+            else:
+                await message.reply_text(
+                    f"❌ **Bot is not admin in this channel!**\n\n"
+                    f"Please make sure:\n"
+                    f"1. Bot is added to channel: {channel_title}\n"
+                    f"2. Bot has permission to send messages\n"
+                    f"3. Bot has permission to post media"
+                )
+        else:
+            await message.reply_text("❌ **Please reply to a forwarded message from your channel.**")
+    else:
+        # Manual channel ID input
+        channel_input = message.command[1].lower()
+        if channel_input in ["off", "disable", "none"]:
+            await db.set_dump_channel(None)
+            await message.reply_text("✅ **Dump channel disabled**")
+        else:
+            try:
+                channel_id = int(channel_input) if channel_input.startswith('-100') else channel_input
+                is_admin = await check_bot_admin(client, channel_id)
+                
+                if is_admin:
+                    await db.set_dump_channel(channel_id)
+                    await message.reply_text(f"✅ **Dump channel set to:** `{channel_id}`")
+                else:
+                    await message.reply_text("❌ **Bot is not admin in this channel!**")
+            except:
+                await message.reply_text("❌ **Invalid channel!** Please use channel ID or username.")
 
 @app.on_message(filters.private & filters.command("addalloweduser"))
 @main_owner_only
@@ -315,22 +463,6 @@ async def mode_command(client, message):
     else:
         await db.set_private_mode(False)
         await message.reply_text("✅ **Public mode ON**")
-
-@app.on_message(filters.private & filters.command("dumpchannel"))
-@main_owner_only
-async def dump_channel_command(client, message):
-    if len(message.command) < 2:
-        current_channel = Config.DUMP_CHANNEL if Config.DUMP_CHANNEL else "Not set"
-        await message.reply_text(f"**Current Dump Channel:** `{current_channel}`\n\n**Usage:** `/dumpchannel CHANNEL_ID`\n\nTo disable: `/dumpchannel off`")
-        return
-    
-    channel = message.command[1].lower()
-    if channel in ["off", "disable", "none"]:
-        Config.DUMP_CHANNEL = ""
-        await message.reply_text("✅ **Dump channel disabled**")
-    else:
-        Config.DUMP_CHANNEL = channel
-        await message.reply_text(f"✅ **Dump channel set to:** `{channel}`")
 
 @app.on_message(filters.private & filters.command("cancel"))
 @private_access
@@ -509,9 +641,13 @@ async def handle_file(client, message):
 **Type:** `{file_type.title()}`
 **Duration:** `{duration_text}`
 
-**Click RENAME to continue.**"""
+**Choose an action:**"""
 
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Rename", callback_data="start_rename")]])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Rename", callback_data="start_rename")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_confirm_{user_id}")]
+    ])
+    
     await message.reply_text(info_text, reply_markup=keyboard)
 
 # ========== CALLBACK HANDLERS ==========
@@ -593,8 +729,8 @@ async def upload_type_callback(client, callback_query):
         file_path = await client.download_media(
             original_message,
             file_name=download_path,
-            progress=progress_for_pyrogram,
-            progress_args=("📥 **Downloading File**", progress_msg, start_time, final_filename)
+            progress=lambda current, total: progress_for_pyrogram(current, total, "📥 **Downloading File**", progress_msg, start_time, final_filename, user_id),
+            progress_args=("📥 **Downloading File**", progress_msg, start_time, final_filename, user_id)
         )
         
         # Check if download was cancelled
@@ -622,7 +758,7 @@ async def upload_type_callback(client, callback_query):
             except:
                 pass
         
-        # Update progress message for upload
+        # Update progress message for upload (with cancel button)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_confirm_{user_id}")]
         ])
@@ -637,8 +773,8 @@ async def upload_type_callback(client, callback_query):
                 document=file_path,
                 thumb=thumb_path,
                 caption=f"`{final_filename}`",
-                progress=progress_for_pyrogram,
-                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
+                progress=lambda current, total: progress_for_pyrogram(current, total, "📤 **Uploading File**", progress_msg, start_time, final_filename, user_id),
+                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename, user_id)
             )
         else:
             sent_message = await client.send_video(
@@ -648,8 +784,8 @@ async def upload_type_callback(client, callback_query):
                 caption=f"`{final_filename}`",
                 duration=original_duration,
                 supports_streaming=True,
-                progress=progress_for_pyrogram,
-                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
+                progress=lambda current, total: progress_for_pyrogram(current, total, "📤 **Uploading File**", progress_msg, start_time, final_filename, user_id),
+                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename, user_id)
             )
         
         # Check if upload was cancelled
@@ -658,16 +794,15 @@ async def upload_type_callback(client, callback_query):
             return
         
         # ✅ SEND TO DUMP CHANNEL (after successful upload to user)
-        if Config.DUMP_CHANNEL:
-            await send_to_dump_channel(
-                client, 
-                file_path, 
-                final_filename, 
-                user_id, 
-                file_info['file_type'], 
-                original_duration, 
-                thumb_path
-            )
+        await send_to_dump_channel(
+            client, 
+            file_path, 
+            final_filename, 
+            user_id, 
+            file_info['file_type'], 
+            original_duration, 
+            thumb_path
+        )
         
         await callback_query.message.reply_text(f"✅ **File renamed successfully!**\n\n**New Name:** `{final_filename}`")
         
@@ -696,7 +831,7 @@ async def upload_type_callback(client, callback_query):
             del cancellation_flags[user_id]
 
 # ========== FILENAME HANDLER ==========
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "addalloweduser", "removealloweduser", "allowedusers", "users", "mode", "dumpchannel"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "addalloweduser", "removealloweduser", "allowedusers", "users", "mode", "setdumpchannel"]))
 @private_access
 async def handle_filename(client, message):
     user_id = message.from_user.id
@@ -766,8 +901,4 @@ async def handle_filename(client, message):
 # ========== START BOT ==========
 if __name__ == "__main__":
     print("🚀 Bot starting...")
-    if Config.DUMP_CHANNEL:
-        print(f"📦 Dump Channel: {Config.DUMP_CHANNEL}")
-    else:
-        print("📦 Dump Channel: Disabled")
     app.run()
