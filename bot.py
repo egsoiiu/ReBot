@@ -18,7 +18,6 @@ class Config:
     BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
     DB_URL = os.environ.get("DB_URL", "")
     DB_NAME = "RenameBot"
-    # Main owner IDs
     OWNER_IDS = [int(x.strip()) for x in os.environ.get("OWNER_IDS", "0").split(",") if x.strip().isdigit()]
 
 # ========== SIMPLE HTTP SERVER ==========
@@ -39,14 +38,14 @@ health_thread = threading.Thread(target=run_health_server, daemon=True)
 health_thread.start()
 
 # ========== UTILITY FUNCTIONS ==========
-async def progress_for_pyrogram(current, total, ud_type, message, start, filename):
+async def progress_for_pyrogram(current, total, ud_type, message, start, filename, user_id):
     now = time.time()
     diff = now - start
     if round(diff % 2.00) == 0 or current == total:
         percentage = current * 100 / total
-        speed = current / diff
+        speed = current / diff if diff > 0 else 0
         elapsed_time = round(diff) * 1000
-        time_to_completion = round((total - current) / speed) * 1000
+        time_to_completion = round((total - current) / speed) * 1000 if speed > 0 else 0
         estimated_total_time = elapsed_time + time_to_completion
 
         elapsed_time = TimeFormatter(milliseconds=elapsed_time)
@@ -67,8 +66,14 @@ async def progress_for_pyrogram(current, total, ud_type, message, start, filenam
 
 ⏰ **ETA:** {estimated_total_time if estimated_total_time != '' else '0s'}
 """
+        
+        # Add cancel button to progress
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_progress_{user_id}")]
+        ])
+        
         try:
-            await message.edit(text=progress_text)
+            await message.edit(text=progress_text, reply_markup=keyboard)
         except:
             pass
 
@@ -159,7 +164,8 @@ app = Client("rename_bot", api_id=Config.API_ID, api_hash=Config.API_HASH, bot_t
 
 # ========== GLOBAL VARIABLES ==========
 user_states = {}
-cancellation_flags = {}
+active_downloads = {}
+active_uploads = {}
 
 # ========== ACCESS CONTROL ==========
 def private_access(func):
@@ -173,7 +179,11 @@ def private_access(func):
         if await db.is_allowed_user(user_id):
             return await func(client, message)
         else:
-            await message.reply_text("🚫 **This bot is in private mode. Contact owner for access.**")
+            # Only send one access denied message
+            if user_id not in user_states or user_states.get(user_id, {}).get('access_denied_sent') != True:
+                await message.reply_text("🚫 **This bot is in private mode. Contact owner for access.**")
+                if user_id in user_states:
+                    user_states[user_id]['access_denied_sent'] = True
             return
     return wrapper
 
@@ -193,7 +203,7 @@ async def start_command(client, message):
     private_mode = await db.get_private_mode()
     
     if private_mode and not await db.is_allowed_user(user_id):
-        await message.reply_text("🚫 **Private bot. Contact owner.**")
+        await message.reply_text("🚫 **This bot is in private mode. Contact owner for access.**")
         return
     
     is_owner = user_id in Config.OWNER_IDS
@@ -276,19 +286,108 @@ async def mode_command(client, message):
 @private_access
 async def cancel_command(client, message):
     user_id = message.from_user.id
-    cancellation_flags[user_id] = True
     
+    # Cancel active downloads
+    if user_id in active_downloads:
+        active_downloads[user_id] = True
+    
+    # Cancel active uploads  
+    if user_id in active_uploads:
+        active_uploads[user_id] = True
+    
+    # Cleanup files and state
     if user_id in user_states:
         user_data = user_states[user_id]
         if user_data.get('file_path') and os.path.exists(user_data['file_path']):
-            try: os.remove(user_data['file_path']) 
+            try: 
+                os.remove(user_data['file_path'])
+            except: 
+                pass
+        if user_data.get('thumb_path') and os.path.exists(user_data['thumb_path']):
+            try: 
+                os.remove(user_data['thumb_path'])
+            except: 
+                pass
+        del user_states[user_id]
+    
+    await message.reply_text("✅ **Process cancelled successfully!**")
+
+# ========== CANCEL CALLBACK HANDLERS ==========
+@app.on_callback_query(filters.regex(r"^cancel_progress_(\d+)$"))
+async def cancel_progress_handler(client, callback_query):
+    user_id = callback_query.from_user.id
+    target_user_id = int(callback_query.matches[0].group(1))
+    
+    if user_id != target_user_id:
+        await callback_query.answer("❌ You can only cancel your own processes!", show_alert=True)
+        return
+    
+    # Show confirmation
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Yes, Cancel", callback_data=f"confirm_cancel_{user_id}")],
+        [InlineKeyboardButton("❌ No, Continue", callback_data=f"deny_cancel_{user_id}")]
+    ])
+    
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=keyboard)
+        await callback_query.answer("Are you sure you want to cancel?")
+    except:
+        await callback_query.answer("Error updating message", show_alert=True)
+
+@app.on_callback_query(filters.regex(r"^confirm_cancel_(\d+)$"))
+async def confirm_cancel_handler(client, callback_query):
+    user_id = callback_query.from_user.id
+    target_user_id = int(callback_query.matches[0].group(1))
+    
+    if user_id != target_user_id:
+        await callback_query.answer("❌ Access denied!", show_alert=True)
+        return
+    
+    # Cancel active processes
+    if user_id in active_downloads:
+        active_downloads[user_id] = True
+    if user_id in active_uploads:
+        active_uploads[user_id] = True
+    
+    # Cleanup
+    if user_id in user_states:
+        user_data = user_states[user_id]
+        if user_data.get('file_path') and os.path.exists(user_data['file_path']):
+            try: os.remove(user_data['file_path'])
             except: pass
         if user_data.get('thumb_path') and os.path.exists(user_data['thumb_path']):
-            try: os.remove(user_data['thumb_path']) 
+            try: os.remove(user_data['thumb_path'])
             except: pass
         del user_states[user_id]
     
-    await message.reply_text("✅ **Cancelled**")
+    await callback_query.message.edit_text("✅ **Process cancelled successfully!**")
+    await callback_query.answer()
+
+@app.on_callback_query(filters.regex(r"^deny_cancel_(\d+)$"))
+async def deny_cancel_handler(client, callback_query):
+    user_id = callback_query.from_user.id
+    target_user_id = int(callback_query.matches[0].group(1))
+    
+    if user_id != target_user_id:
+        await callback_query.answer("❌ Access denied!", show_alert=True)
+        return
+    
+    # Clear cancellation flags
+    if user_id in active_downloads:
+        del active_downloads[user_id]
+    if user_id in active_uploads:
+        del active_uploads[user_id]
+    
+    # Restore cancel button
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_progress_{user_id}")]
+    ])
+    
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=keyboard)
+        await callback_query.answer("✅ Process continued")
+    except:
+        await callback_query.answer("Error updating message", show_alert=True)
 
 # ========== THUMBNAIL MANAGEMENT ==========
 @app.on_message(filters.private & filters.command(["view_thumb", "viewthumbnail"]))
@@ -323,11 +422,14 @@ async def handle_file(client, message):
     user_id = message.from_user.id
     
     if user_id in user_states:
-        await message.reply_text("❌ **Finish current process first**")
+        await message.reply_text("❌ **Please complete your current process first!**\nUse /cancel to cancel.")
         return
     
-    if user_id in cancellation_flags:
-        del cancellation_flags[user_id]
+    # Clear any active cancellation flags
+    if user_id in active_downloads:
+        del active_downloads[user_id]
+    if user_id in active_uploads:
+        del active_uploads[user_id]
     
     # Get file info
     if message.document:
@@ -357,19 +459,20 @@ async def handle_file(client, message):
             'original_message': message,
             'file_id': file.file_id
         },
-        'step': 'awaiting_rename'
+        'step': 'awaiting_rename',
+        'access_denied_sent': False
     }
 
     duration_text = convert_seconds(duration) if duration > 0 else "N/A"
     
-    info_text = f"""**File Info:**
+    info_text = f"""**📁 File Information:**
 
 **Name:** `{file_name}`
 **Size:** `{file_size}`
-**Type:** `{file_type}`
+**Type:** `{file_type.title()}`
 **Duration:** `{duration_text}`
 
-Click **RENAME** to continue."""
+**Click RENAME to continue.**"""
 
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Rename", callback_data="start_rename")]])
     await message.reply_text(info_text, reply_markup=keyboard)
@@ -381,7 +484,7 @@ async def start_rename_callback(client, callback_query):
     user_id = callback_query.from_user.id
     
     if user_id not in user_states:
-        await callback_query.answer("Session expired!", show_alert=True)
+        await callback_query.answer("Session expired! Send file again.", show_alert=True)
         return
     
     user_states[user_id]['step'] = 'awaiting_filename'
@@ -391,7 +494,7 @@ async def start_rename_callback(client, callback_query):
     except:
         pass
     
-    ask_msg = await callback_query.message.reply_text("**Send new filename (without extension):**")
+    ask_msg = await callback_query.message.reply_text("**📝 Send new filename (without extension):**")
     user_states[user_id]['ask_message_id'] = ask_msg.id
     await callback_query.answer()
 
@@ -441,27 +544,32 @@ async def upload_type_callback(client, callback_query):
         download_path = f"downloads/{final_filename}"
         os.makedirs("downloads", exist_ok=True)
         
-        progress_msg = await callback_query.message.reply_text("🔄 **Processing...**")
+        progress_msg = await callback_query.message.reply_text("🔄 **Processing your file...**")
         start_time = time.time()
+        
+        # Set active download flag
+        active_downloads[user_id] = False
         
         # Download with progress
         file_path = await client.download_media(
             original_message,
             file_name=download_path,
             progress=progress_for_pyrogram,
-            progress_args=("📥 **Downloading**", progress_msg, start_time, final_filename)
+            progress_args=("📥 **Downloading File**", progress_msg, start_time, final_filename, user_id)
         )
         
-        if user_id in cancellation_flags and cancellation_flags[user_id]:
-            await progress_msg.edit_text("✅ **Cancelled**")
+        # Check if download was cancelled
+        if user_id in active_downloads and active_downloads[user_id]:
+            await progress_msg.edit_text("✅ **Download cancelled!**")
             if file_path and os.path.exists(file_path):
                 try: os.remove(file_path)
                 except: pass
             if user_id in user_states: del user_states[user_id]
-            if user_id in cancellation_flags: del cancellation_flags[user_id]
+            if user_id in active_downloads: del active_downloads[user_id]
+            if user_id in active_uploads: del active_uploads[user_id]
             return
         
-        if not file_path:
+        if not file_path or not os.path.exists(file_path):
             raise Exception("Download failed")
         
         user_states[user_id]['file_path'] = file_path
@@ -476,7 +584,8 @@ async def upload_type_callback(client, callback_query):
             except:
                 pass
         
-        # Upload with progress
+        # Set active upload flag
+        active_uploads[user_id] = False
         start_time = time.time()
         
         if upload_type == "document" or original_ext.lower() in ['.pdf', '.txt', '.doc', '.docx']:
@@ -486,7 +595,7 @@ async def upload_type_callback(client, callback_query):
                 thumb=thumb_path,
                 caption=f"`{final_filename}`",
                 progress=progress_for_pyrogram,
-                progress_args=("📤 **Uploading**", progress_msg, start_time, final_filename)
+                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename, user_id)
             )
         else:
             await client.send_video(
@@ -497,14 +606,15 @@ async def upload_type_callback(client, callback_query):
                 duration=original_duration,
                 supports_streaming=True,
                 progress=progress_for_pyrogram,
-                progress_args=("📤 **Uploading**", progress_msg, start_time, final_filename)
+                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename, user_id)
             )
         
-        if user_id in cancellation_flags and cancellation_flags[user_id]:
-            await progress_msg.edit_text("✅ **Cancelled**")
+        # Check if upload was cancelled
+        if user_id in active_uploads and active_uploads[user_id]:
+            await progress_msg.edit_text("✅ **Upload cancelled!**")
             return
         
-        await callback_query.message.reply_text(f"✅ **Renamed to** `{final_filename}`")
+        await callback_query.message.reply_text(f"✅ **File renamed successfully!**\n\n**New Name:** `{final_filename}`")
         
         try:
             await progress_msg.delete()
@@ -525,8 +635,12 @@ async def upload_type_callback(client, callback_query):
                 try: os.remove(user_data['thumb_path'])
                 except: pass
             del user_states[user_id]
-        if user_id in cancellation_flags:
-            del cancellation_flags[user_id]
+        
+        # Clear active flags
+        if user_id in active_downloads:
+            del active_downloads[user_id]
+        if user_id in active_uploads:
+            del active_uploads[user_id]
 
 # ========== FILENAME HANDLER ==========
 @app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "addalloweduser", "removealloweduser", "allowedusers", "users", "mode"]))
@@ -586,7 +700,7 @@ async def handle_filename(client, message):
     # Auto document for certain types
     if original_ext.lower() in ['.pdf', '.txt', '.doc', '.docx']:
         user_states[user_id]['step'] = 'processing'
-        # Handle auto upload here (similar to callback but simpler)
+        # Handle auto upload here
         return
     
     keyboard = InlineKeyboardMarkup([
@@ -594,7 +708,7 @@ async def handle_filename(client, message):
         [InlineKeyboardButton("🎥 Video", callback_data="upload_video")]
     ])
     
-    await message.reply_text(f"**Select type for:** `{final_name}`", reply_markup=keyboard)
+    await message.reply_text(f"**Select Upload Type:**\n\n**File:** `{final_name}`", reply_markup=keyboard)
 
 # ========== START BOT ==========
 if __name__ == "__main__":
