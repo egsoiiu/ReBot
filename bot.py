@@ -18,9 +18,9 @@ class Config:
     BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
     DB_URL = os.environ.get("DB_URL", "")
     DB_NAME = "RenameBot"
-    # Private mode - set to True to restrict bot to owners only
+    # Private mode - set to True to restrict bot to allowed users only
     PRIVATE_MODE = os.environ.get("PRIVATE_MODE", "False").lower() == "true"
-    # Initial owner (your Telegram ID) - you can add more using /addowner
+    # Main owner (your Telegram ID) - only this user can manage allowed users
     OWNER_IDS = [int(x.strip()) for x in os.environ.get("OWNER_IDS", "0").split(",") if x.strip().isdigit()]
 
 # ========== SIMPLE HTTP SERVER FOR RENDER PORT ==========
@@ -44,7 +44,7 @@ health_thread = threading.Thread(target=run_health_server, daemon=True)
 health_thread.start()
 
 # ========== UTILITY FUNCTIONS ==========
-async def progress_for_pyrogram(current, total, ud_type, message, start, filename):
+async def progress_for_pyrogram(current, total, ud_type, message, start, filename, user_id):
     now = time.time()
     diff = now - start
     if round(diff % 2.00) == 0 or current == total:  # Update every 2 seconds
@@ -75,8 +75,14 @@ async def progress_for_pyrogram(current, total, ud_type, message, start, filenam
 
 ⏰ **ETA:** {estimated_total_time if estimated_total_time != '' else '0s'}
 """
+        
+        # Add cancel button
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{user_id}")]
+        ])
+        
         try:
-            await message.edit(text=progress_text)
+            await message.edit(text=progress_text, reply_markup=keyboard)
         except MessageNotModified:
             pass
         except Exception:
@@ -127,7 +133,7 @@ class Database:
         self._client = motor.motor_asyncio.AsyncIOMotorClient(uri)
         self.db = self._client[database_name]
         self.col = self.db.users
-        self.owners = self.db.owners
+        self.allowed_users = self.db.allowed_users
 
     async def set_thumbnail(self, user_id, file_id):
         await self.col.update_one(
@@ -140,34 +146,31 @@ class Database:
         user = await self.col.find_one({"_id": user_id})
         return user.get("file_id") if user else None
 
-    # Owner management methods
-    async def add_owner(self, user_id):
-        await self.owners.update_one(
+    # Allowed users management methods
+    async def add_allowed_user(self, user_id):
+        await self.allowed_users.update_one(
             {"_id": user_id},
             {"$set": {"added_at": time.time()}},
             upsert=True
         )
 
-    async def remove_owner(self, user_id):
-        await self.owners.delete_one({"_id": user_id})
+    async def remove_allowed_user(self, user_id):
+        await self.allowed_users.delete_one({"_id": user_id})
 
-    async def is_owner(self, user_id):
-        # Check initial owner IDs from config
+    async def is_allowed_user(self, user_id):
+        # Check if user is main owner
         if user_id in Config.OWNER_IDS:
             return True
-        # Check database owners
-        owner = await self.owners.find_one({"_id": user_id})
-        return owner is not None
+        # Check database allowed users
+        allowed_user = await self.allowed_users.find_one({"_id": user_id})
+        return allowed_user is not None
 
-    async def get_all_owners(self):
-        owners = []
-        # Add initial owners
-        for owner_id in Config.OWNER_IDS:
-            owners.append({"id": owner_id, "type": "initial"})
-        # Add database owners
-        async for owner in self.owners.find():
-            owners.append({"id": owner["_id"], "type": "added"})
-        return owners
+    async def get_all_allowed_users(self):
+        allowed_users = []
+        # Only return database allowed users (not main owners)
+        async for user in self.allowed_users.find():
+            allowed_users.append({"id": user["_id"], "added_at": user.get("added_at", 0)})
+        return allowed_users
 
     async def get_all_users(self):
         users = []
@@ -195,6 +198,7 @@ app = Client(
 
 # ========== GLOBAL VARIABLES ==========
 user_states = {}
+cancellation_flags = {}
 
 # ========== ACCESS CONTROL DECORATOR ==========
 def private_access(func):
@@ -205,103 +209,91 @@ def private_access(func):
         if not Config.PRIVATE_MODE:
             return await func(client, message)
         
-        # Check if user is owner
-        if await db.is_owner(user_id):
+        # Check if user is allowed
+        if await db.is_allowed_user(user_id):
             return await func(client, message)
         else:
             await message.reply_text(
                 "**🚫 Access Denied**\n\n"
-                "This bot is currently in private mode and can only be used by authorized owners."
+                "This bot is currently in private mode and can only be used by authorized users."
             )
             return
     
     return wrapper
 
-# ========== OWNER MANAGEMENT COMMANDS ==========
-@app.on_message(filters.private & filters.command("addowner"))
-@private_access
-async def add_owner_command(client, message):
-    user_id = message.from_user.id
-    
-    # Check if command user is owner
-    if not await db.is_owner(user_id):
-        await message.reply_text("**🚫 You are not authorized to use this command.**")
-        return
-    
-    if len(message.command) < 2:
-        await message.reply_text("**Usage:** `/addowner <user_id>`")
-        return
-    
-    try:
-        new_owner_id = int(message.command[1])
-        await db.add_owner(new_owner_id)
-        await message.reply_text(f"**✅ User `{new_owner_id}` added as owner.**")
-    except ValueError:
-        await message.reply_text("**❌ Invalid user ID. Please provide a numeric ID.**")
-    except Exception as e:
-        await message.reply_text(f"**❌ Error:** `{str(e)}`")
-
-@app.on_message(filters.private & filters.command("removeowner"))
-@private_access
-async def remove_owner_command(client, message):
-    user_id = message.from_user.id
-    
-    # Check if command user is owner
-    if not await db.is_owner(user_id):
-        await message.reply_text("**🚫 You are not authorized to use this command.**")
-        return
-    
-    if len(message.command) < 2:
-        await message.reply_text("**Usage:** `/removeowner <user_id>`")
-        return
-    
-    try:
-        remove_owner_id = int(message.command[1])
+# ========== MAIN OWNER CHECK DECORATOR ==========
+def main_owner_only(func):
+    async def wrapper(client, message):
+        user_id = message.from_user.id
         
-        # Prevent removing initial owners
-        if remove_owner_id in Config.OWNER_IDS:
-            await message.reply_text("**❌ Cannot remove initial owner from configuration.**")
+        # Check if user is main owner
+        if user_id in Config.OWNER_IDS:
+            return await func(client, message)
+        else:
+            await message.reply_text("**🚫 This command is only for main owners.**")
             return
-        
-        await db.remove_owner(remove_owner_id)
-        await message.reply_text(f"**✅ User `{remove_owner_id}` removed from owners.**")
+    
+    return wrapper
+
+# ========== ALLOWED USER MANAGEMENT COMMANDS ==========
+@app.on_message(filters.private & filters.command("addalloweduser"))
+@main_owner_only
+async def add_allowed_user_command(client, message):
+    user_id = message.from_user.id
+    
+    if len(message.command) < 2:
+        await message.reply_text("**Usage:** `/addalloweduser <user_id>`")
+        return
+    
+    try:
+        new_user_id = int(message.command[1])
+        await db.add_allowed_user(new_user_id)
+        await message.reply_text(f"**✅ User `{new_user_id}` added as allowed user.**")
     except ValueError:
         await message.reply_text("**❌ Invalid user ID. Please provide a numeric ID.**")
     except Exception as e:
         await message.reply_text(f"**❌ Error:** `{str(e)}`")
 
-@app.on_message(filters.private & filters.command("owners"))
-@private_access
-async def list_owners_command(client, message):
+@app.on_message(filters.private & filters.command("removealloweduser"))
+@main_owner_only
+async def remove_allowed_user_command(client, message):
     user_id = message.from_user.id
     
-    # Check if command user is owner
-    if not await db.is_owner(user_id):
-        await message.reply_text("**🚫 You are not authorized to use this command.**")
+    if len(message.command) < 2:
+        await message.reply_text("**Usage:** `/removealloweduser <user_id>`")
         return
     
-    owners = await db.get_all_owners()
+    try:
+        remove_user_id = int(message.command[1])
+        await db.remove_allowed_user(remove_user_id)
+        await message.reply_text(f"**✅ User `{remove_user_id}` removed from allowed users.**")
+    except ValueError:
+        await message.reply_text("**❌ Invalid user ID. Please provide a numeric ID.**")
+    except Exception as e:
+        await message.reply_text(f"**❌ Error:** `{str(e)}`")
+
+@app.on_message(filters.private & filters.command("allowedusers"))
+@main_owner_only
+async def list_allowed_users_command(client, message):
+    user_id = message.from_user.id
     
-    if not owners:
-        await message.reply_text("**No owners found.**")
+    allowed_users = await db.get_all_allowed_users()
+    
+    if not allowed_users:
+        await message.reply_text("**No allowed users found.**")
         return
     
-    owners_text = "**👑 Bot Owners:**\n\n"
-    for owner in owners:
-        owner_type = "🔧 Initial" if owner["type"] == "initial" else "➕ Added"
-        owners_text += f"{owner_type}: `{owner['id']}`\n"
+    allowed_users_text = "**👥 Allowed Users:**\n\n"
+    for user in allowed_users:
+        added_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(user["added_at"]))
+        allowed_users_text += f"`{user['id']}` - Added: `{added_time}`\n"
     
-    await message.reply_text(owners_text)
+    await message.reply_text(allowed_users_text)
 
 @app.on_message(filters.private & filters.command("users"))
-@private_access
+@main_owner_only
 async def list_users_command(client, message):
     user_id = message.from_user.id
-    
-    # Check if command user is owner
-    if not await db.is_owner(user_id):
-        await message.reply_text("**🚫 You are not authorized to use this command.**")
-        return
     
     users = await db.get_all_users()
     
@@ -319,21 +311,16 @@ async def list_users_command(client, message):
     await message.reply_text(users_text)
 
 @app.on_message(filters.private & filters.command("mode"))
-@private_access
+@main_owner_only
 async def mode_command(client, message):
     user_id = message.from_user.id
-    
-    # Check if command user is owner
-    if not await db.is_owner(user_id):
-        await message.reply_text("**🚫 You are not authorized to use this command.**")
-        return
     
     if len(message.command) < 2:
         current_mode = "PRIVATE" if Config.PRIVATE_MODE else "PUBLIC"
         await message.reply_text(
             f"**🔒 Current Mode:** `{current_mode}`\n\n"
             "**Usage:** `/mode <private|public>`\n"
-            "• `private` - Only owners can use the bot\n"
+            "• `private` - Only allowed users can use the bot\n"
             "• `public` - Anyone can use the bot"
         )
         return
@@ -341,12 +328,118 @@ async def mode_command(client, message):
     mode = message.command[1].lower()
     if mode in ["private", "true", "1"]:
         Config.PRIVATE_MODE = True
-        await message.reply_text("**✅ Bot mode set to PRIVATE**\nOnly owners can use the bot.")
+        await message.reply_text("**✅ Bot mode set to PRIVATE**\nOnly allowed users can use the bot.")
     elif mode in ["public", "false", "0"]:
         Config.PRIVATE_MODE = False
         await message.reply_text("**✅ Bot mode set to PUBLIC**\nAnyone can use the bot.")
     else:
         await message.reply_text("**❌ Invalid mode. Use `private` or `public`**")
+
+# ========== CANCEL COMMAND ==========
+@app.on_message(filters.private & filters.command("cancel"))
+@private_access
+async def cancel_command(client, message):
+    user_id = message.from_user.id
+    
+    # Set cancellation flag
+    cancellation_flags[user_id] = True
+    
+    # Clear user state and cleanup files
+    if user_id in user_states:
+        # Cleanup downloaded files
+        user_data = user_states[user_id]
+        if 'file_path' in user_data and user_data['file_path'] and os.path.exists(user_data['file_path']):
+            try:
+                os.remove(user_data['file_path'])
+            except:
+                pass
+        if 'thumb_path' in user_data and user_data['thumb_path'] and os.path.exists(user_data['thumb_path']):
+            try:
+                os.remove(user_data['thumb_path'])
+            except:
+                pass
+        
+        # Clear user state
+        del user_states[user_id]
+    
+    await message.reply_text("**✅ Process cancelled successfully! All files cleared.**")
+
+# ========== CANCEL CALLBACK HANDLER ==========
+@app.on_callback_query(filters.regex(r"^cancel_(\d+)$"))
+async def cancel_callback_handler(client, callback_query):
+    user_id = callback_query.from_user.id
+    target_user_id = int(callback_query.matches[0].group(1))
+    
+    # Check if the user is cancelling their own process
+    if user_id != target_user_id:
+        await callback_query.answer("You can only cancel your own processes!", show_alert=True)
+        return
+    
+    # Show confirmation buttons
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Yes, Cancel", callback_data=f"confirm_cancel_{user_id}")],
+        [InlineKeyboardButton("❌ No, Continue", callback_data=f"deny_cancel_{user_id}")]
+    ])
+    
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=keyboard)
+        await callback_query.answer("Are you sure you want to cancel?")
+    except Exception as e:
+        await callback_query.answer("Error updating message", show_alert=True)
+
+@app.on_callback_query(filters.regex(r"^confirm_cancel_(\d+)$"))
+async def confirm_cancel_handler(client, callback_query):
+    user_id = callback_query.from_user.id
+    target_user_id = int(callback_query.matches[0].group(1))
+    
+    if user_id != target_user_id:
+        await callback_query.answer("You can only cancel your own processes!", show_alert=True)
+        return
+    
+    # Set cancellation flag
+    cancellation_flags[user_id] = True
+    
+    # Cleanup files and clear state
+    if user_id in user_states:
+        user_data = user_states[user_id]
+        if 'file_path' in user_data and user_data['file_path'] and os.path.exists(user_data['file_path']):
+            try:
+                os.remove(user_data['file_path'])
+            except:
+                pass
+        if 'thumb_path' in user_data and user_data['thumb_path'] and os.path.exists(user_data['thumb_path']):
+            try:
+                os.remove(user_data['thumb_path'])
+            except:
+                pass
+        del user_states[user_id]
+    
+    await callback_query.message.edit_text("**✅ Process cancelled successfully! All files cleared.**")
+    await callback_query.answer()
+
+@app.on_callback_query(filters.regex(r"^deny_cancel_(\d+)$"))
+async def deny_cancel_handler(client, callback_query):
+    user_id = callback_query.from_user.id
+    target_user_id = int(callback_query.matches[0].group(1))
+    
+    if user_id != target_user_id:
+        await callback_query.answer("Access denied!", show_alert=True)
+        return
+    
+    # Clear cancellation flag
+    if user_id in cancellation_flags:
+        del cancellation_flags[user_id]
+    
+    # Restore cancel button
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{user_id}")]
+    ])
+    
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=keyboard)
+        await callback_query.answer("Process continued")
+    except Exception as e:
+        await callback_query.answer("Error updating message", show_alert=True)
 
 # ========== THUMBNAIL MANAGEMENT ==========
 @app.on_message(filters.private & filters.command(["view_thumb", "viewthumbnail"]))
@@ -370,31 +463,21 @@ async def save_thumbnail(client, message):
     await db.set_thumbnail(message.from_user.id, message.photo.file_id)
     await message.reply_text("**Thumbnail saved successfully!**")
 
-# ========== CANCEL COMMAND ==========
-@app.on_message(filters.private & filters.command("cancel"))
-@private_access
-async def cancel_command(client, message):
-    user_id = message.from_user.id
-    if user_id in user_states:
-        del user_states[user_id]
-        await message.reply_text("**✅ Process cancelled successfully!**")
-    else:
-        await message.reply_text("**❌ No active process to cancel.**")
-
 # ========== START COMMAND ==========
 @app.on_message(filters.private & filters.command("start"))
 async def start_command(client, message):
     user_id = message.from_user.id
     
     # Check access for private mode
-    if Config.PRIVATE_MODE and not await db.is_owner(user_id):
+    if Config.PRIVATE_MODE and not await db.is_allowed_user(user_id):
         await message.reply_text(
             "**🚫 Access Denied**\n\n"
-            "This bot is currently in private mode and can only be used by authorized owners."
+            "This bot is currently in private mode and can only be used by authorized users."
         )
         return
     
-    is_owner = await db.is_owner(user_id)
+    is_main_owner = user_id in Config.OWNER_IDS
+    is_allowed_user = await db.is_allowed_user(user_id)
     
     welcome_text = "**👋 Hello! I'm a File Rename Bot**\n\n"
     welcome_text += "**How to use:**\n"
@@ -407,14 +490,14 @@ async def start_command(client, message):
     welcome_text += "• /view_thumb - View current thumbnail\n"
     welcome_text += "• /del_thumb - Delete thumbnail\n\n"
     welcome_text += "**Other Commands:**\n"
-    welcome_text += "• /cancel - Cancel current process"
+    welcome_text += "• /cancel - Cancel current process and clear files"
     
-    # Add owner commands if user is owner
-    if is_owner:
-        welcome_text += "\n\n**👑 Owner Commands:**\n"
-        welcome_text += "• /addowner <id> - Add owner\n"
-        welcome_text += "• /removeowner <id> - Remove owner\n"
-        welcome_text += "• /owners - List all owners\n"
+    # Add owner commands if user is main owner
+    if is_main_owner:
+        welcome_text += "\n\n**👑 Main Owner Commands:**\n"
+        welcome_text += "• /addalloweduser <id> - Add allowed user\n"
+        welcome_text += "• /removealloweduser <id> - Remove allowed user\n"
+        welcome_text += "• /allowedusers - List all allowed users\n"
         welcome_text += "• /users - List all users\n"
         welcome_text += "• /mode <private|public> - Change bot mode\n"
         welcome_text += f"• **Current Mode:** `{'PRIVATE' if Config.PRIVATE_MODE else 'PUBLIC'}`"
@@ -431,6 +514,10 @@ async def handle_file(client, message):
     if user_id in user_states:
         await message.reply_text("**❌ Please complete your current process first!**\nUse /cancel to cancel.")
         return
+    
+    # Clear any previous cancellation flag
+    if user_id in cancellation_flags:
+        del cancellation_flags[user_id]
     
     # Get file info
     if message.document:
@@ -461,7 +548,9 @@ async def handle_file(client, message):
             'original_message': message,
             'file_id': file.file_id
         },
-        'step': 'awaiting_rename'
+        'step': 'awaiting_rename',
+        'file_path': None,
+        'thumb_path': None
     }
 
     # Show file info with buttons - include duration
@@ -571,12 +660,31 @@ async def upload_type_callback(client, callback_query):
         file_path = await client.download_media(
             original_message,
             file_name=download_path,
-            progress=progress_for_pyrogram,
-            progress_args=("📥 **Downloading File**", progress_msg, start_time, final_filename)
+            progress=lambda current, total: progress_for_pyrogram(
+                current, total, "📥 **Downloading File**", progress_msg, start_time, final_filename, user_id
+            )
         )
+        
+        # Check if download was cancelled
+        if user_id in cancellation_flags and cancellation_flags[user_id]:
+            await progress_msg.edit_text("**✅ Download cancelled by user.**")
+            # Cleanup
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+            if user_id in user_states:
+                del user_states[user_id]
+            if user_id in cancellation_flags:
+                del cancellation_flags[user_id]
+            return
         
         if not file_path or not os.path.exists(file_path):
             raise Exception("Download failed")
+        
+        # Store file path for cleanup
+        user_states[user_id]['file_path'] = file_path
         
         # Get thumbnail
         thumbnail = await db.get_thumbnail(user_id)
@@ -584,10 +692,11 @@ async def upload_type_callback(client, callback_query):
         if thumbnail:
             try:
                 thumb_path = await client.download_media(thumbnail)
+                user_states[user_id]['thumb_path'] = thumb_path
             except:
                 pass
         
-        # Upload file with progress (no separate "Uploading" message)
+        # Upload file with progress
         start_time = time.time()
         
         # Check if file should be forced as document
@@ -602,8 +711,9 @@ async def upload_type_callback(client, callback_query):
                 document=file_path,
                 thumb=thumb_path,
                 caption=f"`{final_filename}`",
-                progress=progress_for_pyrogram,
-                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
+                progress=lambda current, total: progress_for_pyrogram(
+                    current, total, "📤 **Uploading File**", progress_msg, start_time, final_filename, user_id
+                )
             )
         else:  # video
             await client.send_video(
@@ -613,9 +723,15 @@ async def upload_type_callback(client, callback_query):
                 caption=f"`{final_filename}`",
                 duration=original_duration,
                 supports_streaming=True,
-                progress=progress_for_pyrogram,
-                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
+                progress=lambda current, total: progress_for_pyrogram(
+                    current, total, "📤 **Uploading File**", progress_msg, start_time, final_filename, user_id
+                )
             )
+        
+        # Check if upload was cancelled
+        if user_id in cancellation_flags and cancellation_flags[user_id]:
+            await progress_msg.edit_text("**✅ Upload cancelled by user.**")
+            return
         
         # Success message
         duration_text = convert_seconds(original_duration) if original_duration > 0 else "Unknown"
@@ -639,23 +755,27 @@ async def upload_type_callback(client, callback_query):
     
     finally:
         # Cleanup files
-        if 'file_path' in locals() and file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except:
-                pass
-        if 'thumb_path' in locals() and thumb_path and os.path.exists(thumb_path):
-            try:
-                os.remove(thumb_path)
-            except:
-                pass
+        if user_id in user_states:
+            user_data = user_states[user_id]
+            if 'file_path' in user_data and user_data['file_path'] and os.path.exists(user_data['file_path']):
+                try:
+                    os.remove(user_data['file_path'])
+                except:
+                    pass
+            if 'thumb_path' in user_data and user_data['thumb_path'] and os.path.exists(user_data['thumb_path']):
+                try:
+                    os.remove(user_data['thumb_path'])
+                except:
+                    pass
         
-        # Clear user state
+        # Clear user state and cancellation flag
         if user_id in user_states:
             del user_states[user_id]
+        if user_id in cancellation_flags:
+            del cancellation_flags[user_id]
 
 # ========== FILENAME INPUT HANDLER ==========
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "addowner", "removeowner", "owners", "users", "mode"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "addalloweduser", "removealloweduser", "allowedusers", "users", "mode"]))
 @private_access
 async def handle_filename(client, message):
     user_id = message.from_user.id
@@ -758,12 +878,31 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
         file_path = await client.download_media(
             original_message,
             file_name=download_path,
-            progress=progress_for_pyrogram,
-            progress_args=("📥 **Downloading File**", progress_msg, start_time, final_name)
+            progress=lambda current, total: progress_for_pyrogram(
+                current, total, "📥 **Downloading File**", progress_msg, start_time, final_name, user_id
+            )
         )
+        
+        # Check if download was cancelled
+        if user_id in cancellation_flags and cancellation_flags[user_id]:
+            await progress_msg.edit_text("**✅ Download cancelled by user.**")
+            # Cleanup
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+            if user_id in user_states:
+                del user_states[user_id]
+            if user_id in cancellation_flags:
+                del cancellation_flags[user_id]
+            return
         
         if not file_path or not os.path.exists(file_path):
             raise Exception("Download failed")
+        
+        # Store file path for cleanup
+        user_states[user_id]['file_path'] = file_path
         
         # Get thumbnail
         thumbnail = await db.get_thumbnail(user_id)
@@ -771,6 +910,7 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
         if thumbnail:
             try:
                 thumb_path = await client.download_media(thumbnail)
+                user_states[user_id]['thumb_path'] = thumb_path
             except:
                 pass
         
@@ -782,9 +922,15 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
             document=file_path,
             thumb=thumb_path,
             caption=f"`{final_name}`",
-            progress=progress_for_pyrogram,
-            progress_args=("📤 **Uploading File**", progress_msg, start_time, final_name)
+            progress=lambda current, total: progress_for_pyrogram(
+                current, total, "📤 **Uploading File**", progress_msg, start_time, final_name, user_id
+            )
         )
+        
+        # Check if upload was cancelled
+        if user_id in cancellation_flags and cancellation_flags[user_id]:
+            await progress_msg.edit_text("**✅ Upload cancelled by user.**")
+            return
         
         # Success message
         await message.reply_text(
@@ -806,25 +952,29 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
     
     finally:
         # Cleanup files
-        if 'file_path' in locals() and file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except:
-                pass
-        if 'thumb_path' in locals() and thumb_path and os.path.exists(thumb_path):
-            try:
-                os.remove(thumb_path)
-            except:
-                pass
+        if user_id in user_states:
+            user_data = user_states[user_id]
+            if 'file_path' in user_data and user_data['file_path'] and os.path.exists(user_data['file_path']):
+                try:
+                    os.remove(user_data['file_path'])
+                except:
+                    pass
+            if 'thumb_path' in user_data and user_data['thumb_path'] and os.path.exists(user_data['thumb_path']):
+                try:
+                    os.remove(user_data['thumb_path'])
+                except:
+                    pass
         
-        # Clear user state
+        # Clear user state and cancellation flag
         if user_id in user_states:
             del user_states[user_id]
+        if user_id in cancellation_flags:
+            del cancellation_flags[user_id]
 
 # ========== START BOT ==========
 if __name__ == "__main__":
     print("🚀 Bot is starting...")
     print("🌐 Health check server running on port 8080")
     print(f"🔒 Private Mode: {Config.PRIVATE_MODE}")
-    print(f"👑 Initial Owners: {Config.OWNER_IDS}")
+    print(f"👑 Main Owners: {len(Config.OWNER_IDS)} users")
     app.run()
