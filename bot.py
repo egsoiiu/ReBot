@@ -18,6 +18,10 @@ class Config:
     BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
     DB_URL = os.environ.get("DB_URL", "")
     DB_NAME = "RenameBot"
+    # Private mode - set to True to restrict bot to owners only
+    PRIVATE_MODE = os.environ.get("PRIVATE_MODE", "False").lower() == "true"
+    # Initial owner (your Telegram ID) - you can add more using /addowner
+    OWNER_IDS = [int(x.strip()) for x in os.environ.get("OWNER_IDS", "0").split(",") if x.strip().isdigit()]
 
 # ========== SIMPLE HTTP SERVER FOR RENDER PORT ==========
 class HealthHandler(BaseHTTPRequestHandler):
@@ -123,6 +127,7 @@ class Database:
         self._client = motor.motor_asyncio.AsyncIOMotorClient(uri)
         self.db = self._client[database_name]
         self.col = self.db.users
+        self.owners = self.db.owners
 
     async def set_thumbnail(self, user_id, file_id):
         await self.col.update_one(
@@ -134,6 +139,41 @@ class Database:
     async def get_thumbnail(self, user_id):
         user = await self.col.find_one({"_id": user_id})
         return user.get("file_id") if user else None
+
+    # Owner management methods
+    async def add_owner(self, user_id):
+        await self.owners.update_one(
+            {"_id": user_id},
+            {"$set": {"added_at": time.time()}},
+            upsert=True
+        )
+
+    async def remove_owner(self, user_id):
+        await self.owners.delete_one({"_id": user_id})
+
+    async def is_owner(self, user_id):
+        # Check initial owner IDs from config
+        if user_id in Config.OWNER_IDS:
+            return True
+        # Check database owners
+        owner = await self.owners.find_one({"_id": user_id})
+        return owner is not None
+
+    async def get_all_owners(self):
+        owners = []
+        # Add initial owners
+        for owner_id in Config.OWNER_IDS:
+            owners.append({"id": owner_id, "type": "initial"})
+        # Add database owners
+        async for owner in self.owners.find():
+            owners.append({"id": owner["_id"], "type": "added"})
+        return owners
+
+    async def get_all_users(self):
+        users = []
+        async for user in self.col.find():
+            users.append(user["_id"])
+        return users
 
 # Initialize database
 db = Database(Config.DB_URL, Config.DB_NAME)
@@ -156,8 +196,161 @@ app = Client(
 # ========== GLOBAL VARIABLES ==========
 user_states = {}
 
+# ========== ACCESS CONTROL DECORATOR ==========
+def private_access(func):
+    async def wrapper(client, message):
+        user_id = message.from_user.id
+        
+        # If private mode is disabled, allow all users
+        if not Config.PRIVATE_MODE:
+            return await func(client, message)
+        
+        # Check if user is owner
+        if await db.is_owner(user_id):
+            return await func(client, message)
+        else:
+            await message.reply_text(
+                "**🚫 Access Denied**\n\n"
+                "This bot is currently in private mode and can only be used by authorized owners."
+            )
+            return
+    
+    return wrapper
+
+# ========== OWNER MANAGEMENT COMMANDS ==========
+@app.on_message(filters.private & filters.command("addowner"))
+@private_access
+async def add_owner_command(client, message):
+    user_id = message.from_user.id
+    
+    # Check if command user is owner
+    if not await db.is_owner(user_id):
+        await message.reply_text("**🚫 You are not authorized to use this command.**")
+        return
+    
+    if len(message.command) < 2:
+        await message.reply_text("**Usage:** `/addowner <user_id>`")
+        return
+    
+    try:
+        new_owner_id = int(message.command[1])
+        await db.add_owner(new_owner_id)
+        await message.reply_text(f"**✅ User `{new_owner_id}` added as owner.**")
+    except ValueError:
+        await message.reply_text("**❌ Invalid user ID. Please provide a numeric ID.**")
+    except Exception as e:
+        await message.reply_text(f"**❌ Error:** `{str(e)}`")
+
+@app.on_message(filters.private & filters.command("removeowner"))
+@private_access
+async def remove_owner_command(client, message):
+    user_id = message.from_user.id
+    
+    # Check if command user is owner
+    if not await db.is_owner(user_id):
+        await message.reply_text("**🚫 You are not authorized to use this command.**")
+        return
+    
+    if len(message.command) < 2:
+        await message.reply_text("**Usage:** `/removeowner <user_id>`")
+        return
+    
+    try:
+        remove_owner_id = int(message.command[1])
+        
+        # Prevent removing initial owners
+        if remove_owner_id in Config.OWNER_IDS:
+            await message.reply_text("**❌ Cannot remove initial owner from configuration.**")
+            return
+        
+        await db.remove_owner(remove_owner_id)
+        await message.reply_text(f"**✅ User `{remove_owner_id}` removed from owners.**")
+    except ValueError:
+        await message.reply_text("**❌ Invalid user ID. Please provide a numeric ID.**")
+    except Exception as e:
+        await message.reply_text(f"**❌ Error:** `{str(e)}`")
+
+@app.on_message(filters.private & filters.command("owners"))
+@private_access
+async def list_owners_command(client, message):
+    user_id = message.from_user.id
+    
+    # Check if command user is owner
+    if not await db.is_owner(user_id):
+        await message.reply_text("**🚫 You are not authorized to use this command.**")
+        return
+    
+    owners = await db.get_all_owners()
+    
+    if not owners:
+        await message.reply_text("**No owners found.**")
+        return
+    
+    owners_text = "**👑 Bot Owners:**\n\n"
+    for owner in owners:
+        owner_type = "🔧 Initial" if owner["type"] == "initial" else "➕ Added"
+        owners_text += f"{owner_type}: `{owner['id']}`\n"
+    
+    await message.reply_text(owners_text)
+
+@app.on_message(filters.private & filters.command("users"))
+@private_access
+async def list_users_command(client, message):
+    user_id = message.from_user.id
+    
+    # Check if command user is owner
+    if not await db.is_owner(user_id):
+        await message.reply_text("**🚫 You are not authorized to use this command.**")
+        return
+    
+    users = await db.get_all_users()
+    
+    if not users:
+        await message.reply_text("**No users found in database.**")
+        return
+    
+    users_text = f"**👥 Total Users: {len(users)}**\n\n"
+    for user_id in users[:20]:  # Show first 20 users
+        users_text += f"`{user_id}`\n"
+    
+    if len(users) > 20:
+        users_text += f"\n... and {len(users) - 20} more users."
+    
+    await message.reply_text(users_text)
+
+@app.on_message(filters.private & filters.command("mode"))
+@private_access
+async def mode_command(client, message):
+    user_id = message.from_user.id
+    
+    # Check if command user is owner
+    if not await db.is_owner(user_id):
+        await message.reply_text("**🚫 You are not authorized to use this command.**")
+        return
+    
+    if len(message.command) < 2:
+        current_mode = "PRIVATE" if Config.PRIVATE_MODE else "PUBLIC"
+        await message.reply_text(
+            f"**🔒 Current Mode:** `{current_mode}`\n\n"
+            "**Usage:** `/mode <private|public>`\n"
+            "• `private` - Only owners can use the bot\n"
+            "• `public` - Anyone can use the bot"
+        )
+        return
+    
+    mode = message.command[1].lower()
+    if mode in ["private", "true", "1"]:
+        Config.PRIVATE_MODE = True
+        await message.reply_text("**✅ Bot mode set to PRIVATE**\nOnly owners can use the bot.")
+    elif mode in ["public", "false", "0"]:
+        Config.PRIVATE_MODE = False
+        await message.reply_text("**✅ Bot mode set to PUBLIC**\nAnyone can use the bot.")
+    else:
+        await message.reply_text("**❌ Invalid mode. Use `private` or `public`**")
+
 # ========== THUMBNAIL MANAGEMENT ==========
 @app.on_message(filters.private & filters.command(["view_thumb", "viewthumbnail"]))
+@private_access
 async def view_thumbnail(client, message):
     thumbnail = await db.get_thumbnail(message.from_user.id)
     if thumbnail:
@@ -166,17 +359,20 @@ async def view_thumbnail(client, message):
         await message.reply_text("**You don't have any thumbnail set.**")
 
 @app.on_message(filters.private & filters.command(["del_thumb", "deletethumbnail"]))
+@private_access
 async def delete_thumbnail(client, message):
     await db.set_thumbnail(message.from_user.id, None)
     await message.reply_text("**Thumbnail deleted successfully!**")
 
 @app.on_message(filters.private & filters.photo)
+@private_access
 async def save_thumbnail(client, message):
     await db.set_thumbnail(message.from_user.id, message.photo.file_id)
     await message.reply_text("**Thumbnail saved successfully!**")
 
 # ========== CANCEL COMMAND ==========
 @app.on_message(filters.private & filters.command("cancel"))
+@private_access
 async def cancel_command(client, message):
     user_id = message.from_user.id
     if user_id in user_states:
@@ -188,23 +384,46 @@ async def cancel_command(client, message):
 # ========== START COMMAND ==========
 @app.on_message(filters.private & filters.command("start"))
 async def start_command(client, message):
-    await message.reply_text(
-        "**👋 Hello! I'm a File Rename Bot**\n\n"
-        "**How to use:**\n"
-        "1. Send me any file (document/video/audio)\n"
-        "2. Click 'Rename' button\n"
-        "3. Enter new filename\n"
-        "4. Select upload type\n\n"
-        "**Thumbnail Commands:**\n"
-        "• Send a photo to set thumbnail\n"
-        "• /view_thumb - View current thumbnail\n"
-        "• /del_thumb - Delete thumbnail\n\n"
-        "**Other Commands:**\n"
-        "• /cancel - Cancel current process"
-    )
+    user_id = message.from_user.id
+    
+    # Check access for private mode
+    if Config.PRIVATE_MODE and not await db.is_owner(user_id):
+        await message.reply_text(
+            "**🚫 Access Denied**\n\n"
+            "This bot is currently in private mode and can only be used by authorized owners."
+        )
+        return
+    
+    is_owner = await db.is_owner(user_id)
+    
+    welcome_text = "**👋 Hello! I'm a File Rename Bot**\n\n"
+    welcome_text += "**How to use:**\n"
+    welcome_text += "1. Send me any file (document/video/audio)\n"
+    welcome_text += "2. Click 'Rename' button\n"
+    welcome_text += "3. Enter new filename\n"
+    welcome_text += "4. Select upload type\n\n"
+    welcome_text += "**Thumbnail Commands:**\n"
+    welcome_text += "• Send a photo to set thumbnail\n"
+    welcome_text += "• /view_thumb - View current thumbnail\n"
+    welcome_text += "• /del_thumb - Delete thumbnail\n\n"
+    welcome_text += "**Other Commands:**\n"
+    welcome_text += "• /cancel - Cancel current process"
+    
+    # Add owner commands if user is owner
+    if is_owner:
+        welcome_text += "\n\n**👑 Owner Commands:**\n"
+        welcome_text += "• /addowner <id> - Add owner\n"
+        welcome_text += "• /removeowner <id> - Remove owner\n"
+        welcome_text += "• /owners - List all owners\n"
+        welcome_text += "• /users - List all users\n"
+        welcome_text += "• /mode <private|public> - Change bot mode\n"
+        welcome_text += f"• **Current Mode:** `{'PRIVATE' if Config.PRIVATE_MODE else 'PUBLIC'}`"
+    
+    await message.reply_text(welcome_text)
 
 # ========== FILE RENAME HANDLER ==========
 @app.on_message(filters.private & (filters.document | filters.video | filters.audio))
+@private_access
 async def handle_file(client, message):
     user_id = message.from_user.id
     
@@ -259,13 +478,13 @@ async def handle_file(client, message):
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Rename", callback_data="start_rename")]
-        # Removed cancel button
     ])
     
     await message.reply_text(info_text, reply_markup=keyboard)
 
 # ========== CALLBACK HANDLERS ==========
 @app.on_callback_query(filters.regex("^start_rename$"))
+@private_access
 async def start_rename_callback(client, callback_query):
     user_id = callback_query.from_user.id
     
@@ -295,6 +514,7 @@ async def start_rename_callback(client, callback_query):
     await callback_query.answer()
 
 @app.on_callback_query(filters.regex("^upload_(document|video)$"))
+@private_access
 async def upload_type_callback(client, callback_query):
     user_id = callback_query.from_user.id
     upload_type = callback_query.data.split("_")[1]
@@ -435,7 +655,8 @@ async def upload_type_callback(client, callback_query):
             del user_states[user_id]
 
 # ========== FILENAME INPUT HANDLER ==========
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "addowner", "removeowner", "owners", "users", "mode"]))
+@private_access
 async def handle_filename(client, message):
     user_id = message.from_user.id
     
@@ -508,7 +729,6 @@ async def handle_filename(client, message):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📄 Document", callback_data="upload_document")],
         [InlineKeyboardButton("🎥 Video", callback_data="upload_video")]
-        # Removed cancel button
     ])
     
     await message.reply_text(
@@ -605,4 +825,6 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
 if __name__ == "__main__":
     print("🚀 Bot is starting...")
     print("🌐 Health check server running on port 8080")
+    print(f"🔒 Private Mode: {Config.PRIVATE_MODE}")
+    print(f"👑 Initial Owners: {Config.OWNER_IDS}")
     app.run()
