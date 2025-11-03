@@ -1,14 +1,12 @@
 import os
 import asyncio
-import logging
 import math
 import time
 import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import QueryIdInvalid, MessageNotModified
 import motor.motor_asyncio
 
 # ========== CONFIG ==========
@@ -150,7 +148,6 @@ class Database:
     async def set_private_mode(self, value):
         await self.settings.update_one({"_id": "private_mode"}, {"$set": {"value": value}}, upsert=True)
 
-    # Dump channel management
     async def get_dump_channel(self):
         setting = await self.settings.find_one({"_id": "dump_channel"})
         return setting.get("value") if setting else ""
@@ -168,78 +165,42 @@ app = Client("rename_bot", api_id=Config.API_ID, api_hash=Config.API_HASH, bot_t
 user_states = {}
 cancellation_flags = {}
 
-# ========== DUMP CHANNEL FUNCTION (CLEAN CAPTION) ==========
+# ========== DUMP CHANNEL FUNCTION ==========
 async def send_to_dump_channel(client, file_path, final_filename, user_id, file_type, original_duration, user_thumbnail=None, original_thumbnail=None):
-    """Send file to dump channel with clean caption"""
     dump_channel = await db.get_dump_channel()
     if not dump_channel:
         return
     
     try:
-        # Create clickable user ID
         user_mention = f"[{user_id}](tg://user?id={user_id})"
+        caption = f"**📁 File Name:** `{final_filename}`\n**👤 User:** {user_mention}\n**📊 Type:** `{file_type}`"
         
-        # Clean caption without thumbnail status
-        caption = f"**📁 File Name:** `{final_filename}`\n"
-        caption += f"**👤 User:** {user_mention}\n"
-        caption += f"**📊 Type:** `{file_type}`"
-        
-        # Send the main file
         thumb_to_use = user_thumbnail if user_thumbnail else original_thumbnail
         
         if file_type == "document":
-            await client.send_document(
-                dump_channel,
-                document=file_path,
-                caption=caption,
-                thumb=thumb_to_use
-            )
+            await client.send_document(dump_channel, document=file_path, caption=caption, thumb=thumb_to_use)
         elif file_type == "video":
-            await client.send_video(
-                dump_channel,
-                video=file_path,
-                caption=caption,
-                duration=original_duration,
-                thumb=thumb_to_use,
-                supports_streaming=True
-            )
+            await client.send_video(dump_channel, video=file_path, caption=caption, duration=original_duration, thumb=thumb_to_use, supports_streaming=True)
         elif file_type == "audio":
-            await client.send_audio(
-                dump_channel,
-                audio=file_path,
-                caption=caption,
-                thumb=thumb_to_use
-            )
+            await client.send_audio(dump_channel, audio=file_path, caption=caption, thumb=thumb_to_use)
         
         print(f"✅ File dumped to channel: {final_filename}")
-        
     except Exception as e:
         print(f"❌ Error dumping to channel: {e}")
 
-# ========== SEND THUMBNAIL TO DUMP CHANNEL ==========
 async def send_thumbnail_to_dump_channel(client, photo_message, user_id):
-    """Send user's thumbnail photo to dump channel when they set it"""
     dump_channel = await db.get_dump_channel()
     if not dump_channel:
         return
     
     try:
-        # Create clickable user ID
         user_mention = f"[{user_id}](tg://user?id={user_id})"
-        
         caption = f"**🖼️ New Custom Thumbnail Set**\n**👤 User:** {user_mention}\n**🕒 Time:** {time.strftime('%Y-%m-%d %H:%M:%S')}"
         
-        # Forward the photo to dump channel
         await photo_message.forward(dump_channel)
-        
-        # Also send the caption
-        await client.send_message(
-            dump_channel,
-            caption
-        )
+        await client.send_message(dump_channel, caption)
         
         print(f"✅ Thumbnail dumped to channel from user: {user_id}")
-        
     except Exception as e:
         print(f"❌ Error dumping thumbnail to channel: {e}")
 
@@ -249,10 +210,7 @@ def private_access(func):
         user_id = message.from_user.id
         private_mode = await db.get_private_mode()
         
-        if not private_mode:
-            return await func(client, message)
-        
-        if await db.is_allowed_user(user_id):
+        if not private_mode or await db.is_allowed_user(user_id):
             return await func(client, message)
         else:
             await message.reply_text("🚫 **This bot is in private mode. Contact owner for access.**")
@@ -274,9 +232,7 @@ async def start_command(client, message):
     user_id = message.from_user.id
     private_mode = await db.get_private_mode()
     
-    is_allowed = await db.is_allowed_user(user_id)
-    
-    if private_mode and not is_allowed:
+    if private_mode and not await db.is_allowed_user(user_id):
         await message.reply_text("🚫 **This bot is in private mode. Contact owner for access.**")
         return
     
@@ -389,26 +345,14 @@ async def dump_channel_command(client, message):
 @private_access
 async def cancel_command(client, message):
     user_id = message.from_user.id
-    
     cancellation_flags[user_id] = True
     
     if user_id in user_states:
         user_data = user_states[user_id]
-        if user_data.get('file_path') and os.path.exists(user_data['file_path']):
-            try: 
-                os.remove(user_data['file_path'])
-            except: 
-                pass
-        if user_data.get('thumb_path') and os.path.exists(user_data['thumb_path']):
-            try: 
-                os.remove(user_data['thumb_path'])
-            except: 
-                pass
-        if user_data.get('original_thumb_path') and os.path.exists(user_data['original_thumb_path']):
-            try: 
-                os.remove(user_data['original_thumb_path'])
-            except: 
-                pass
+        for file_type in ['file_path', 'thumb_path', 'original_thumb_path']:
+            if user_data.get(file_type) and os.path.exists(user_data[file_type]):
+                try: os.remove(user_data[file_type])
+                except: pass
         del user_states[user_id]
     
     await message.reply_text("✅ **Process cancelled successfully!**")
@@ -447,15 +391,10 @@ async def cancel_yes_handler(client, callback_query):
     
     if user_id in user_states:
         user_data = user_states[user_id]
-        if user_data.get('file_path') and os.path.exists(user_data['file_path']):
-            try: os.remove(user_data['file_path'])
-            except: pass
-        if user_data.get('thumb_path') and os.path.exists(user_data['thumb_path']):
-            try: os.remove(user_data['thumb_path'])
-            except: pass
-        if user_data.get('original_thumb_path') and os.path.exists(user_data['original_thumb_path']):
-            try: os.remove(user_data['original_thumb_path'])
-            except: pass
+        for file_type in ['file_path', 'thumb_path', 'original_thumb_path']:
+            if user_data.get(file_type) and os.path.exists(user_data[file_type]):
+                try: os.remove(user_data[file_type])
+                except: pass
         del user_states[user_id]
     
     await callback_query.message.edit_text("✅ **Process cancelled successfully!**")
@@ -507,12 +446,8 @@ async def delete_thumbnail(client, message):
 @private_access
 async def save_thumbnail(client, message):
     user_id = message.from_user.id
-    
-    # Save thumbnail to database
     await db.set_thumbnail(user_id, message.photo.file_id)
     await message.reply_text("✅ **Thumbnail saved successfully!**")
-    
-    # ✅ SEND THUMBNAIL TO DUMP CHANNEL
     await send_thumbnail_to_dump_channel(client, message, user_id)
 
 # ========== FILE HANDLING ==========
@@ -528,22 +463,18 @@ async def handle_file(client, message):
     if user_id in cancellation_flags:
         del cancellation_flags[user_id]
     
-    # Get file info
     if message.document:
         file = message.document
         file_type = "document"
         duration = 0
-        original_thumbnail = getattr(file, 'thumb', None)
     elif message.video:
         file = message.video
         file_type = "video"
         duration = getattr(file, 'duration', 0)
-        original_thumbnail = getattr(file, 'thumb', None)
     elif message.audio:
         file = message.audio
         file_type = "audio"
         duration = getattr(file, 'duration', 0)
-        original_thumbnail = getattr(file, 'thumb', None)
     else:
         return
 
@@ -558,7 +489,7 @@ async def handle_file(client, message):
             'duration': duration,
             'original_message': message,
             'file_id': file.file_id,
-            'original_thumbnail': original_thumbnail
+            'original_thumbnail': getattr(file, 'thumb', None)
         },
         'step': 'awaiting_rename'
     }
@@ -622,37 +553,23 @@ async def upload_type_callback(client, callback_query):
         original_duration = file_info['duration']
         original_thumbnail = file_info.get('original_thumbnail')
         
-        # Get original extension
         original_name = file_info['file_name']
         if not original_name or original_name == 'Unknown':
-            if file_info['file_type'] == 'video':
-                original_ext = '.mp4'
-            elif file_info['file_type'] == 'audio':
-                original_ext = '.mp3'
-            else:
-                original_ext = '.bin'
+            original_ext = '.mp4' if file_info['file_type'] == 'video' else '.mp3' if file_info['file_type'] == 'audio' else '.bin'
         else:
             _, original_ext = os.path.splitext(original_name)
             if not original_ext:
-                if file_info['file_type'] == 'video':
-                    original_ext = '.mp4'
-                elif file_info['file_type'] == 'audio':
-                    original_ext = '.mp3'
-                else:
-                    original_ext = '.bin'
+                original_ext = '.mp4' if file_info['file_type'] == 'video' else '.mp3' if file_info['file_type'] == 'audio' else '.bin'
         
         final_filename = f"{new_filename}{original_ext}"
         download_path = f"downloads/{final_filename}"
         os.makedirs("downloads", exist_ok=True)
         
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_confirm_{user_id}")]
-        ])
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_confirm_{user_id}")]])
         progress_msg = await callback_query.message.reply_text("🔄 **Processing your file...**", reply_markup=keyboard)
         
         start_time = time.time()
         
-        # Download with progress
         file_path = await client.download_media(
             original_message,
             file_name=download_path,
@@ -674,19 +591,15 @@ async def upload_type_callback(client, callback_query):
         
         user_states[user_id]['file_path'] = file_path
         
-        # Get user's custom thumbnail
-        user_thumbnail = None
         user_thumb_path = None
         thumbnail = await db.get_thumbnail(user_id)
         if thumbnail:
             try:
                 user_thumb_path = await client.download_media(thumbnail)
                 user_states[user_id]['thumb_path'] = user_thumb_path
-                user_thumbnail = user_thumb_path
             except:
                 pass
         
-        # Get original file thumbnail if exists
         original_thumb_path = None
         if original_thumbnail:
             try:
@@ -695,19 +608,14 @@ async def upload_type_callback(client, callback_query):
             except:
                 pass
         
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_confirm_{user_id}")]
-        ])
         await progress_msg.edit_text("🔄 **Uploading file...**", reply_markup=keyboard)
         
         start_time = time.time()
         
-        # Decide which thumbnail to use for user (priority: user thumbnail > original thumbnail)
         thumb_to_use = user_thumb_path if user_thumb_path else original_thumb_path
         
-        # Send to user first
         if upload_type == "document" or original_ext.lower() in ['.pdf', '.txt', '.doc', '.docx']:
-            sent_message = await client.send_document(
+            await client.send_document(
                 callback_query.message.chat.id,
                 document=file_path,
                 thumb=thumb_to_use,
@@ -716,7 +624,7 @@ async def upload_type_callback(client, callback_query):
                 progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
             )
         else:
-            sent_message = await client.send_video(
+            await client.send_video(
                 callback_query.message.chat.id,
                 video=file_path,
                 thumb=thumb_to_use,
@@ -731,16 +639,10 @@ async def upload_type_callback(client, callback_query):
             await progress_msg.edit_text("✅ **Upload cancelled!**")
             return
         
-        # ✅ SEND TO DUMP CHANNEL WITH CLEAN CAPTION
         await send_to_dump_channel(
-            client, 
-            file_path, 
-            final_filename, 
-            user_id, 
-            file_info['file_type'], 
-            original_duration, 
-            user_thumbnail=user_thumb_path,
-            original_thumbnail=original_thumb_path
+            client, file_path, final_filename, user_id, 
+            file_info['file_type'], original_duration, 
+            user_thumb_path, original_thumb_path
         )
         
         await callback_query.message.reply_text(f"✅ **File renamed successfully!**\n\n**New Name:** `{final_filename}`")
@@ -756,15 +658,10 @@ async def upload_type_callback(client, callback_query):
     finally:
         if user_id in user_states:
             user_data = user_states[user_id]
-            if user_data.get('file_path') and os.path.exists(user_data['file_path']):
-                try: os.remove(user_data['file_path'])
-                except: pass
-            if user_data.get('thumb_path') and os.path.exists(user_data['thumb_path']):
-                try: os.remove(user_data['thumb_path'])
-                except: pass
-            if user_data.get('original_thumb_path') and os.path.exists(user_data['original_thumb_path']):
-                try: os.remove(user_data['original_thumb_path'])
-                except: pass
+            for file_type in ['file_path', 'thumb_path', 'original_thumb_path']:
+                if user_data.get(file_type) and os.path.exists(user_data[file_type]):
+                    try: os.remove(user_data[file_type])
+                    except: pass
             del user_states[user_id]
         
         if user_id in cancellation_flags:
@@ -806,21 +703,11 @@ async def handle_filename(client, message):
     file_info = user_states[user_id]['file_info']
     original_name = file_info['file_name']
     if not original_name or original_name == 'Unknown':
-        if file_info['file_type'] == 'video':
-            original_ext = '.mp4'
-        elif file_info['file_type'] == 'audio':
-            original_ext = '.mp3'
-        else:
-            original_ext = '.bin'
+        original_ext = '.mp4' if file_info['file_type'] == 'video' else '.mp3' if file_info['file_type'] == 'audio' else '.bin'
     else:
         _, original_ext = os.path.splitext(original_name)
         if not original_ext:
-            if file_info['file_type'] == 'video':
-                original_ext = '.mp4'
-            elif file_info['file_type'] == 'audio':
-                original_ext = '.mp3'
-            else:
-                original_ext = '.bin'
+            original_ext = '.mp4' if file_info['file_type'] == 'video' else '.mp3' if file_info['file_type'] == 'audio' else '.bin'
     
     final_name = f"{clean_name}{original_ext}"
     
@@ -836,11 +723,24 @@ async def handle_filename(client, message):
     await message.reply_text(f"**Select Upload Type:**\n\n**File:** `{final_name}`", reply_markup=keyboard)
 
 # ========== START BOT ==========
-if __name__ == "__main__":
-    print("🚀 Bot starting...")
-    dump_channel = asyncio.run(db.get_dump_channel())
+async def main():
+    await app.start()
+    print("🤖 Bot is starting...")
+    
+    dump_channel = await db.get_dump_channel()
     if dump_channel:
         print(f"📦 Dump Channel: {dump_channel}")
     else:
         print("📦 Dump Channel: Disabled")
-    app.run()
+    
+    print("✅ Bot started successfully!")
+    await idle()
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        print("🛑 Bot stopped by user")
+    finally:
+        print("👋 Bot stopped")
