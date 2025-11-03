@@ -20,6 +20,7 @@ class Config:
     DB_URL = os.environ.get("DB_URL", "")
     DB_NAME = "RenameBot"
     OWNER_IDS = [int(x.strip()) for x in os.environ.get("OWNER_IDS", "0").split(",") if x.strip().isdigit()]
+    DUMP_CHANNEL = os.environ.get("DUMP_CHANNEL", "")  # Your channel ID
 
 # ========== SIMPLE HTTP SERVER FOR RENDER PORT ==========
 class HealthHandler(BaseHTTPRequestHandler):
@@ -246,6 +247,51 @@ def main_owner_only(func):
     
     return wrapper
 
+# ========== DUMP CHANNEL UPLOAD FUNCTION ==========
+async def upload_to_dump_channel(client, file_path, final_filename, file_type, duration, thumb_path=None):
+    """Upload file to dump channel and return file_id"""
+    if not Config.DUMP_CHANNEL:
+        return None
+    
+    try:
+        caption = f"**File:** `{final_filename}`"
+        
+        if file_type == "document":
+            sent_message = await client.send_document(
+                Config.DUMP_CHANNEL,
+                document=file_path,
+                caption=caption,
+                thumb=thumb_path
+            )
+            file_id = sent_message.document.file_id
+        elif file_type == "video":
+            sent_message = await client.send_video(
+                Config.DUMP_CHANNEL,
+                video=file_path,
+                caption=caption,
+                duration=duration,
+                thumb=thumb_path,
+                supports_streaming=True
+            )
+            file_id = sent_message.video.file_id
+        elif file_type == "audio":
+            sent_message = await client.send_audio(
+                Config.DUMP_CHANNEL,
+                audio=file_path,
+                caption=caption,
+                thumb=thumb_path
+            )
+            file_id = sent_message.audio.file_id
+        else:
+            return None
+        
+        print(f"✅ File uploaded to dump channel: {final_filename}")
+        return file_id
+        
+    except Exception as e:
+        print(f"❌ Error uploading to dump channel: {e}")
+        return None
+
 # ========== DEEP LINK HANDLER ==========
 @app.on_message(filters.private & filters.command("start"))
 async def start_command(client, message):
@@ -282,13 +328,16 @@ async def start_command(client, message):
     if is_owner:
         current_mode = await db.get_private_mode()
         mode_text = "PRIVATE" if current_mode else "PUBLIC"
+        dump_status = "✅ ENABLED" if Config.DUMP_CHANNEL else "❌ DISABLED"
         welcome_text += "\n\n**👑 Owner Commands:**\n"
         welcome_text += "• /addalloweduser <id> - Add allowed user\n"
         welcome_text += "• /removealloweduser <id> - Remove allowed user\n"
         welcome_text += "• /allowedusers - List all allowed users\n"
         welcome_text += "• /users - List all users\n"
         welcome_text += "• /mode <private|public> - Change bot mode\n"
-        welcome_text += f"• **Current Mode:** `{mode_text}`"
+        welcome_text += "• /dumpchannel <id> - Set dump channel\n"
+        welcome_text += f"• **Current Mode:** `{mode_text}`\n"
+        welcome_text += f"• **Dump Channel:** `{dump_status}`"
     
     await message.reply_text(welcome_text)
 
@@ -435,6 +484,22 @@ async def mode_command(client, message):
         await message.reply_text("✅ **Bot mode set to PUBLIC**\nAnyone can use the bot.")
     else:
         await message.reply_text("❌ **Invalid mode. Use `private` or `public`**")
+
+@app.on_message(filters.private & filters.command("dumpchannel"))
+@main_owner_only
+async def dump_channel_command(client, message):
+    if len(message.command) < 2:
+        current_channel = Config.DUMP_CHANNEL if Config.DUMP_CHANNEL else "Not set"
+        await message.reply_text(f"**Current Dump Channel:** `{current_channel}`\n\n**Usage:** `/dumpchannel CHANNEL_ID`\n\nTo disable: `/dumpchannel off`")
+        return
+    
+    channel = message.command[1].lower()
+    if channel in ["off", "disable", "none"]:
+        Config.DUMP_CHANNEL = ""
+        await message.reply_text("✅ **Dump channel disabled**")
+    else:
+        Config.DUMP_CHANNEL = channel
+        await message.reply_text(f"✅ **Dump channel set to:** `{channel}`")
 
 # ========== CANCEL COMMAND ==========
 @app.on_message(filters.private & filters.command("cancel"))
@@ -738,44 +803,33 @@ async def upload_type_callback(client, callback_query):
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_confirm_{user_id}")]
         ])
-        await progress_msg.edit_text("🔄 **Uploading file...**", reply_markup=keyboard)
+        await progress_msg.edit_text("🔄 **Uploading to dump channel...**", reply_markup=keyboard)
         
         start_time = time.time()
         
-        if upload_type == "document" or original_ext.lower() in ['.pdf', '.html', '.htm', '.txt', '.doc', '.docx']:
-            sent_message = await client.send_document(
-                "me",
-                document=file_path,
-                thumb=thumb_path,
-                caption=f"`{final_filename}`",
-                progress=progress_for_pyrogram,
-                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
-            )
-            file_id = sent_message.document.file_id
-            final_file_type = "document"
-        else:
-            sent_message = await client.send_video(
-                "me",
-                video=file_path,
-                thumb=thumb_path,
-                caption=f"`{final_filename}`",
-                duration=original_duration,
-                supports_streaming=True,
-                progress=progress_for_pyrogram,
-                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
-            )
-            file_id = sent_message.video.file_id
-            final_file_type = "video"
+        # ✅ UPLOAD TO DUMP CHANNEL AND GET FILE_ID
+        dump_file_id = await upload_to_dump_channel(
+            client,
+            file_path,
+            final_filename,
+            upload_type,
+            original_duration,
+            thumb_path
+        )
+        
+        if not dump_file_id:
+            raise Exception("Failed to upload to dump channel")
         
         if user_id in cancellation_flags and cancellation_flags[user_id]:
             await progress_msg.edit_text("✅ **Upload cancelled!**")
             return
         
+        # ✅ CREATE DEEP LINK USING DUMP CHANNEL FILE_ID
         reference_id = secrets.token_urlsafe(12)
         
         file_data = {
-            'file_id': file_id,
-            'file_type': final_file_type,
+            'file_id': dump_file_id,
+            'file_type': upload_type,
             'file_name': final_filename,
             'thumb': thumbnail,
             'duration': original_duration,
@@ -793,7 +847,7 @@ async def upload_type_callback(client, callback_query):
 
 **File Name:** `{final_filename}`
 **File Size:** {humanbytes(os.path.getsize(file_path))}
-**File Type:** {final_file_type.title()}
+**File Type:** {upload_type.title()}
 
 📦 **Your file is ready! Click the button below to get it instantly:**
 
@@ -847,7 +901,7 @@ async def copy_link_handler(client, callback_query):
     await callback_query.answer(f"Link: {deep_link}\n\nYou can copy this link manually.", show_alert=True)
 
 # ========== FILENAME INPUT HANDLER ==========
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "addalloweduser", "removealloweduser", "allowedusers", "users", "mode"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "addalloweduser", "removealloweduser", "allowedusers", "users", "mode", "dumpchannel"]))
 @private_access
 async def handle_filename(client, message):
     user_id = message.from_user.id
@@ -926,5 +980,9 @@ async def handle_filename(client, message):
 if __name__ == "__main__":
     print("🚀 Bot is starting...")
     print("🌐 Health check server running on port 8080")
-    print("🔒 Deep Link System: Enabled")
+    if Config.DUMP_CHANNEL:
+        print(f"📦 Dump Channel: {Config.DUMP_CHANNEL}")
+    else:
+        print("📦 Dump Channel: Disabled")
+    print("🔗 Deep Link System: Enabled")
     app.run()
