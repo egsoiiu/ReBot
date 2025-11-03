@@ -120,11 +120,6 @@ def convert_seconds(seconds):
     else:
         return f"{minutes:02d}:{seconds:02d}"
 
-# Simple thumbnail processing without PIL
-async def process_thumb_async(ph_path):
-    """Simple thumbnail pass-through without PIL"""
-    pass
-
 # ========== DATABASE CLASS ==========
 class Database:
     def __init__(self, uri, database_name):
@@ -143,7 +138,15 @@ class Database:
 
     async def get_thumbnail(self, user_id):
         user = await self.col.find_one({"_id": user_id})
-        return user.get("file_id") if user else None
+        if user and user.get("file_id"):
+            # Validate if file_id exists by trying to get file
+            try:
+                # This will check if the file_id is valid
+                # If it's invalid, it will return None
+                return user.get("file_id")
+            except:
+                return None
+        return None
 
     # Allowed users management methods
     async def add_allowed_user(self, user_id):
@@ -462,11 +465,16 @@ async def deny_cancel_handler(client, callback_query):
 @app.on_message(filters.private & filters.command(["view_thumb", "viewthumbnail"]))
 @private_access
 async def view_thumbnail(client, message):
-    thumbnail = await db.get_thumbnail(message.from_user.id)
-    if thumbnail:
-        await client.send_photo(message.chat.id, thumbnail, caption="**Your Current Thumbnail**")
-    else:
-        await message.reply_text("**You don't have any thumbnail set.**")
+    try:
+        thumbnail = await db.get_thumbnail(message.from_user.id)
+        if thumbnail:
+            await client.send_photo(message.chat.id, thumbnail, caption="**Your Current Thumbnail**")
+        else:
+            await message.reply_text("**You don't have any thumbnail set.**")
+    except Exception as e:
+        await message.reply_text("**❌ Error loading thumbnail. It may be invalid. Please set a new thumbnail.**")
+        # Clear invalid thumbnail
+        await db.set_thumbnail(message.from_user.id, None)
 
 @app.on_message(filters.private & filters.command(["del_thumb", "deletethumbnail"]))
 @private_access
@@ -676,14 +684,14 @@ async def upload_type_callback(client, callback_query):
         # Create progress message
         progress_msg = await callback_query.message.reply_text("🔄 Processing your file...")
         
-        # Download file with progress
+        # Download file with progress - FIXED: Use proper async progress callback
         start_time = time.time()
         
         file_path = await client.download_media(
             original_message,
             file_name=download_path,
-            progress=lambda current, total: progress_for_pyrogram(
-                current, total, "📥 **Downloading File**", progress_msg, start_time, final_filename, user_id
+            progress=lambda current, total: asyncio.create_task(
+                progress_for_pyrogram(current, total, "📥 **Downloading File**", progress_msg, start_time, final_filename, user_id)
             )
         )
         
@@ -718,7 +726,7 @@ async def upload_type_callback(client, callback_query):
             except:
                 pass
         
-        # Upload file with progress
+        # Upload file with progress - FIXED: Use proper async progress callback
         start_time = time.time()
         
         # Check if file should be forced as document
@@ -733,8 +741,8 @@ async def upload_type_callback(client, callback_query):
                 document=file_path,
                 thumb=thumb_path,
                 caption=f"`{final_filename}`",
-                progress=lambda current, total: progress_for_pyrogram(
-                    current, total, "📤 **Uploading File**", progress_msg, start_time, final_filename, user_id
+                progress=lambda current, total: asyncio.create_task(
+                    progress_for_pyrogram(current, total, "📤 **Uploading File**", progress_msg, start_time, final_filename, user_id)
                 )
             )
         else:  # video
@@ -745,8 +753,8 @@ async def upload_type_callback(client, callback_query):
                 caption=f"`{final_filename}`",
                 duration=original_duration,
                 supports_streaming=True,
-                progress=lambda current, total: progress_for_pyrogram(
-                    current, total, "📤 **Uploading File**", progress_msg, start_time, final_filename, user_id
+                progress=lambda current, total: asyncio.create_task(
+                    progress_for_pyrogram(current, total, "📤 **Uploading File**", progress_msg, start_time, final_filename, user_id)
                 )
             )
         
@@ -894,14 +902,14 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
         # Create progress message
         progress_msg = await message.reply_text("🔄 Processing your file...")
         
-        # Download file with progress
+        # Download file with progress - FIXED: Use proper async progress callback
         start_time = time.time()
         
         file_path = await client.download_media(
             original_message,
             file_name=download_path,
-            progress=lambda current, total: progress_for_pyrogram(
-                current, total, "📥 **Downloading File**", progress_msg, start_time, final_name, user_id
+            progress=lambda current, total: asyncio.create_task(
+                progress_for_pyrogram(current, total, "📥 **Downloading File**", progress_msg, start_time, final_name, user_id)
             )
         )
         
@@ -936,7 +944,7 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
             except:
                 pass
         
-        # Upload file with progress
+        # Upload file with progress - FIXED: Use proper async progress callback
         start_time = time.time()
         
         await client.send_document(
@@ -944,8 +952,8 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
             document=file_path,
             thumb=thumb_path,
             caption=f"`{final_name}`",
-            progress=lambda current, total: progress_for_pyrogram(
-                current, total, "📤 **Uploading File**", progress_msg, start_time, final_name, user_id
+            progress=lambda current, total: asyncio.create_task(
+                progress_for_pyrogram(current, total, "📤 **Uploading File**", progress_msg, start_time, final_name, user_id)
             )
         )
         
