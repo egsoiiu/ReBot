@@ -17,7 +17,7 @@ class Config:
     API_HASH = os.environ.get("API_HASH", "")
     BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
     DB_URL = os.environ.get("DB_URL", "")
-    DB_NAME = "RenameBot"
+    DB_NAME = "Renam"
     # Main owner (your Telegram ID) - only this user can manage allowed users
     OWNER_IDS = [int(x.strip()) for x in os.environ.get("OWNER_IDS", "0").split(",") if x.strip().isdigit()]
 
@@ -42,7 +42,7 @@ health_thread = threading.Thread(target=run_health_server, daemon=True)
 health_thread.start()
 
 # ========== UTILITY FUNCTIONS ==========
-async def progress_for_pyrogram(current, total, ud_type, message, start, filename, user_id):
+async def progress_for_pyrogram(current, total, ud_type, message, start, filename):
     now = time.time()
     diff = now - start
     if round(diff % 2.00) == 0 or current == total:  # Update every 2 seconds
@@ -73,14 +73,8 @@ async def progress_for_pyrogram(current, total, ud_type, message, start, filenam
 
 ⏰ **ETA:** {estimated_total_time if estimated_total_time != '' else '0s'}
 """
-        
-        # Add cancel button
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{user_id}")]
-        ])
-        
         try:
-            await message.edit(text=progress_text, reply_markup=keyboard)
+            await message.edit(text=progress_text)
         except MessageNotModified:
             pass
         except Exception:
@@ -138,15 +132,7 @@ class Database:
 
     async def get_thumbnail(self, user_id):
         user = await self.col.find_one({"_id": user_id})
-        if user and user.get("file_id"):
-            # Validate if file_id exists by trying to get file
-            try:
-                # This will check if the file_id is valid
-                # If it's invalid, it will return None
-                return user.get("file_id")
-            except:
-                return None
-        return None
+        return user.get("file_id") if user else None
 
     # Allowed users management methods
     async def add_allowed_user(self, user_id):
@@ -182,9 +168,9 @@ class Database:
 
     # Settings management (for private mode)
     async def get_private_mode(self):
-        """Get private mode from database, default to False if not set"""
+        """Get private mode from database, default to True if not set"""
         setting = await self.settings.find_one({"_id": "private_mode"})
-        return setting.get("value") if setting else False
+        return setting.get("value") if setting else True  # Default to private
 
     async def set_private_mode(self, value):
         """Set private mode in database"""
@@ -234,7 +220,8 @@ def private_access(func):
         else:
             await message.reply_text(
                 "**🚫 Access Denied**\n\n"
-                "This bot is currently in private mode and can only be used by authorized users."
+                "This bot is currently in private mode and can only be used by authorized users.\n\n"
+                "If you should have access, contact the bot owner."
             )
             return
     
@@ -500,7 +487,8 @@ async def start_command(client, message):
     if private_mode and not await db.is_allowed_user(user_id):
         await message.reply_text(
             "**🚫 Access Denied**\n\n"
-            "This bot is currently in private mode and can only be used by authorized users."
+            "This bot is currently in private mode and can only be used by authorized users.\n\n"
+            "If you should have access, contact the bot owner."
         )
         return
     
@@ -684,15 +672,14 @@ async def upload_type_callback(client, callback_query):
         # Create progress message
         progress_msg = await callback_query.message.reply_text("🔄 Processing your file...")
         
-        # Download file with progress - FIXED: Use proper async progress callback
+        # Download file with progress - FIXED: Use original working progress system
         start_time = time.time()
         
         file_path = await client.download_media(
             original_message,
             file_name=download_path,
-            progress=lambda current, total: asyncio.create_task(
-                progress_for_pyrogram(current, total, "📥 **Downloading File**", progress_msg, start_time, final_filename, user_id)
-            )
+            progress=progress_for_pyrogram,
+            progress_args=("📥 **Downloading File**", progress_msg, start_time, final_filename)
         )
         
         # Check if download was cancelled
@@ -726,7 +713,7 @@ async def upload_type_callback(client, callback_query):
             except:
                 pass
         
-        # Upload file with progress - FIXED: Use proper async progress callback
+        # Upload file with progress - FIXED: Use original working progress system
         start_time = time.time()
         
         # Check if file should be forced as document
@@ -741,9 +728,8 @@ async def upload_type_callback(client, callback_query):
                 document=file_path,
                 thumb=thumb_path,
                 caption=f"`{final_filename}`",
-                progress=lambda current, total: asyncio.create_task(
-                    progress_for_pyrogram(current, total, "📤 **Uploading File**", progress_msg, start_time, final_filename, user_id)
-                )
+                progress=progress_for_pyrogram,
+                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
             )
         else:  # video
             await client.send_video(
@@ -753,9 +739,8 @@ async def upload_type_callback(client, callback_query):
                 caption=f"`{final_filename}`",
                 duration=original_duration,
                 supports_streaming=True,
-                progress=lambda current, total: asyncio.create_task(
-                    progress_for_pyrogram(current, total, "📤 **Uploading File**", progress_msg, start_time, final_filename, user_id)
-                )
+                progress=progress_for_pyrogram,
+                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
             )
         
         # Check if upload was cancelled
@@ -902,15 +887,14 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
         # Create progress message
         progress_msg = await message.reply_text("🔄 Processing your file...")
         
-        # Download file with progress - FIXED: Use proper async progress callback
+        # Download file with progress - FIXED: Use original working progress system
         start_time = time.time()
         
         file_path = await client.download_media(
             original_message,
             file_name=download_path,
-            progress=lambda current, total: asyncio.create_task(
-                progress_for_pyrogram(current, total, "📥 **Downloading File**", progress_msg, start_time, final_name, user_id)
-            )
+            progress=progress_for_pyrogram,
+            progress_args=("📥 **Downloading File**", progress_msg, start_time, final_name)
         )
         
         # Check if download was cancelled
@@ -944,7 +928,7 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
             except:
                 pass
         
-        # Upload file with progress - FIXED: Use proper async progress callback
+        # Upload file with progress - FIXED: Use original working progress system
         start_time = time.time()
         
         await client.send_document(
@@ -952,9 +936,8 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
             document=file_path,
             thumb=thumb_path,
             caption=f"`{final_name}`",
-            progress=lambda current, total: asyncio.create_task(
-                progress_for_pyrogram(current, total, "📤 **Uploading File**", progress_msg, start_time, final_name, user_id)
-            )
+            progress=progress_for_pyrogram,
+            progress_args=("📤 **Uploading File**", progress_msg, start_time, final_name)
         )
         
         # Check if upload was cancelled
@@ -1005,5 +988,5 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
 if __name__ == "__main__":
     print("🚀 Bot is starting...")
     print("🌐 Health check server running on port 8080")
-    print(f"👑 Main Owners: {len(Config.OWNER_IDS)} users")
+    print(f"🔒 Initial Mode: PRIVATE")
     app.run()
