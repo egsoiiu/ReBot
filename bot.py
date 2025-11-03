@@ -18,8 +18,6 @@ class Config:
     BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
     DB_URL = os.environ.get("DB_URL", "")
     DB_NAME = "RenameBot"
-    # Private mode - set to True to restrict bot to allowed users only
-    PRIVATE_MODE = os.environ.get("PRIVATE_MODE", "False").lower() == "true"
     # Main owner (your Telegram ID) - only this user can manage allowed users
     OWNER_IDS = [int(x.strip()) for x in os.environ.get("OWNER_IDS", "0").split(",") if x.strip().isdigit()]
 
@@ -134,6 +132,7 @@ class Database:
         self.db = self._client[database_name]
         self.col = self.db.users
         self.allowed_users = self.db.allowed_users
+        self.settings = self.db.settings
 
     async def set_thumbnail(self, user_id, file_id):
         await self.col.update_one(
@@ -178,6 +177,20 @@ class Database:
             users.append(user["_id"])
         return users
 
+    # Settings management (for private mode)
+    async def get_private_mode(self):
+        """Get private mode from database, default to False if not set"""
+        setting = await self.settings.find_one({"_id": "private_mode"})
+        return setting.get("value") if setting else False
+
+    async def set_private_mode(self, value):
+        """Set private mode in database"""
+        await self.settings.update_one(
+            {"_id": "private_mode"},
+            {"$set": {"value": value}},
+            upsert=True
+        )
+
 # Initialize database
 db = Database(Config.DB_URL, Config.DB_NAME)
 
@@ -205,8 +218,11 @@ def private_access(func):
     async def wrapper(client, message):
         user_id = message.from_user.id
         
+        # Get current private mode from database
+        private_mode = await db.get_private_mode()
+        
         # If private mode is disabled, allow all users
-        if not Config.PRIVATE_MODE:
+        if not private_mode:
             return await func(client, message)
         
         # Check if user is allowed
@@ -316,9 +332,10 @@ async def mode_command(client, message):
     user_id = message.from_user.id
     
     if len(message.command) < 2:
-        current_mode = "PRIVATE" if Config.PRIVATE_MODE else "PUBLIC"
+        current_mode = await db.get_private_mode()
+        mode_text = "PRIVATE" if current_mode else "PUBLIC"
         await message.reply_text(
-            f"**🔒 Current Mode:** `{current_mode}`\n\n"
+            f"**🔒 Current Mode:** `{mode_text}`\n\n"
             "**Usage:** `/mode <private|public>`\n"
             "• `private` - Only allowed users can use the bot\n"
             "• `public` - Anyone can use the bot"
@@ -327,10 +344,10 @@ async def mode_command(client, message):
     
     mode = message.command[1].lower()
     if mode in ["private", "true", "1"]:
-        Config.PRIVATE_MODE = True
+        await db.set_private_mode(True)
         await message.reply_text("**✅ Bot mode set to PRIVATE**\nOnly allowed users can use the bot.")
     elif mode in ["public", "false", "0"]:
-        Config.PRIVATE_MODE = False
+        await db.set_private_mode(False)
         await message.reply_text("**✅ Bot mode set to PUBLIC**\nAnyone can use the bot.")
     else:
         await message.reply_text("**❌ Invalid mode. Use `private` or `public`**")
@@ -468,8 +485,11 @@ async def save_thumbnail(client, message):
 async def start_command(client, message):
     user_id = message.from_user.id
     
+    # Get current private mode from database
+    private_mode = await db.get_private_mode()
+    
     # Check access for private mode
-    if Config.PRIVATE_MODE and not await db.is_allowed_user(user_id):
+    if private_mode and not await db.is_allowed_user(user_id):
         await message.reply_text(
             "**🚫 Access Denied**\n\n"
             "This bot is currently in private mode and can only be used by authorized users."
@@ -494,13 +514,15 @@ async def start_command(client, message):
     
     # Add owner commands if user is main owner
     if is_main_owner:
+        current_mode = await db.get_private_mode()
+        mode_text = "PRIVATE" if current_mode else "PUBLIC"
         welcome_text += "\n\n**👑 Main Owner Commands:**\n"
         welcome_text += "• /addalloweduser <id> - Add allowed user\n"
         welcome_text += "• /removealloweduser <id> - Remove allowed user\n"
         welcome_text += "• /allowedusers - List all allowed users\n"
         welcome_text += "• /users - List all users\n"
         welcome_text += "• /mode <private|public> - Change bot mode\n"
-        welcome_text += f"• **Current Mode:** `{'PRIVATE' if Config.PRIVATE_MODE else 'PUBLIC'}`"
+        welcome_text += f"• **Current Mode:** `{mode_text}`"
     
     await message.reply_text(welcome_text)
 
@@ -975,6 +997,5 @@ async def handle_auto_upload(client, message, user_id, final_name, upload_type):
 if __name__ == "__main__":
     print("🚀 Bot is starting...")
     print("🌐 Health check server running on port 8080")
-    print(f"🔒 Private Mode: {Config.PRIVATE_MODE}")
     print(f"👑 Main Owners: {len(Config.OWNER_IDS)} users")
     app.run()
