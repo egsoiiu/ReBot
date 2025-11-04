@@ -174,22 +174,36 @@ async def send_to_dump_channel(client, file_path, final_filename, user_id, file_
     dump_channel = await db.get_dump_channel()
     
     if not dump_channel:
+        print("❌ No dump channel set")
         return
     
     try:
+        # Convert channel to integer if it's numeric
+        try:
+            if dump_channel.startswith('-100'):
+                dump_channel_id = int(dump_channel)
+            elif dump_channel.startswith('@'):
+                dump_channel_id = dump_channel
+            else:
+                dump_channel_id = int(dump_channel)
+        except ValueError:
+            dump_channel_id = dump_channel
+        
+        print(f"📦 Attempting to send to dump channel: {dump_channel_id}")
+        
         # Prepare caption for dump channel
         caption = f"**File Name:** `{final_filename}`\n**User ID:** `{user_id}`\n**Type:** `{file_type}`"
         
         if file_type == "document":
             await client.send_document(
-                dump_channel,
+                dump_channel_id,
                 document=file_path,
                 caption=caption,
                 thumb=thumb_path
             )
         elif file_type == "video":
             await client.send_video(
-                dump_channel,
+                dump_channel_id,
                 video=file_path,
                 caption=caption,
                 duration=original_duration,
@@ -198,16 +212,16 @@ async def send_to_dump_channel(client, file_path, final_filename, user_id, file_
             )
         elif file_type == "audio":
             await client.send_audio(
-                dump_channel,
+                dump_channel_id,
                 audio=file_path,
                 caption=caption,
                 thumb=thumb_path
             )
         
-        print(f"✅ File dumped to channel: {final_filename}")
+        print(f"✅ File successfully dumped to channel: {final_filename}")
         
     except Exception as e:
-        print(f"❌ Error dumping to channel: {e}")
+        print(f"❌ Error dumping to channel {dump_channel}: {e}")
 
 # ========== ACCESS CONTROL ==========
 def private_access(func):
@@ -644,7 +658,7 @@ async def upload_type_callback(client, callback_query):
         
         # Send to user first
         if upload_type == "document" or original_ext.lower() in ['.pdf', '.txt', '.doc', '.docx']:
-            sent_message = await client.send_document(
+            await client.send_document(
                 callback_query.message.chat.id,
                 document=file_path,
                 thumb=thumb_path,
@@ -653,7 +667,7 @@ async def upload_type_callback(client, callback_query):
                 progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
             )
         else:
-            sent_message = await client.send_video(
+            await client.send_video(
                 callback_query.message.chat.id,
                 video=file_path,
                 thumb=thumb_path,
@@ -672,6 +686,7 @@ async def upload_type_callback(client, callback_query):
         # ✅ SEND TO DUMP CHANNEL (after successful upload to user)
         dump_channel = await db.get_dump_channel()
         if dump_channel:
+            print(f"📦 Dumping file to channel: {dump_channel}")
             await send_to_dump_channel(
                 client, 
                 file_path, 
@@ -691,6 +706,7 @@ async def upload_type_callback(client, callback_query):
             
     except Exception as e:
         await callback_query.message.reply_text(f"❌ **Error:** `{str(e)}`")
+        print(f"❌ Upload error: {e}")
     
     finally:
         # Cleanup
