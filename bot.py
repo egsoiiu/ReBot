@@ -43,6 +43,14 @@ class Config:
     OWNER_IDS = [int(x.strip()) for x in os.getenv("OWNER_IDS", "0").split(",") if x.strip().isdigit()]
     DUMP_CHANNEL = os.getenv("DUMP_CHANNEL", "")
     MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 2147483648))  # 2GB default
+    
+    # Allowed file extensions
+    ALLOWED_EXTENSIONS = {
+        'document': ['.pdf', '.txt', '.doc', '.docx', '.zip', '.rar', '.7z', '.tar', '.gz', 
+                    '.mp3', '.wav', '.flac', '.ogg', '.aac', '.mp4', '.mkv', '.avi', '.mov'],
+        'video': ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v'],
+        'audio': ['.mp3', '.wav', '.flac', '.ogg', '.aac', '.m4a', '.wma']
+    }
 
 # ========== CONFIG VALIDATION ==========
 def validate_config():
@@ -98,6 +106,11 @@ def sanitize_filename(filename):
         filename = name[:100-len(ext)] + ext
     
     return filename.strip() or "file"
+
+def is_allowed_file_type(filename, file_type):
+    """Check if file extension is allowed for the given file type"""
+    _, ext = os.path.splitext(filename.lower())
+    return ext in Config.ALLOWED_EXTENSIONS.get(file_type, [])
 
 async def check_file_size(message):
     """Check if file size is within limits"""
@@ -263,7 +276,7 @@ class Database:
     async def set_private_mode(self, value):
         await self.settings.update_one({"_id": "private_mode"}, {"$set": {"value": value}}, upsert=True)
 
-    # Store dump channel in database to persist across restarts
+    # FIX: Store dump channel in database to persist across restarts
     async def get_dump_channel(self):
         setting = await self.settings.find_one({"_id": "dump_channel"})
         return setting.get("value") if setting else ""
@@ -314,215 +327,42 @@ async def initialize_dump_channel():
         logger.info("No dump channel configured")
 
 async def send_to_dump_channel(client, file_path, final_filename, user_id, file_type, original_duration, thumb_path=None):
-    """Send file to dump channel with enhanced error handling"""
+    """Send file to dump channel"""
     if not Config.DUMP_CHANNEL:
-        return False
-    
-    max_retries = 2
-    for attempt in range(max_retries):
-        try:
-            # Prepare caption for dump channel
-            caption = f"**File Name:** `{final_filename}`\n**User ID:** `{user_id}`\n**Type:** `{file_type}`\n**Time:** {time.ctime()}"
-            
-            if file_type == "document":
-                await client.send_document(
-                    Config.DUMP_CHANNEL,
-                    document=file_path,
-                    caption=caption,
-                    thumb=thumb_path
-                )
-            elif file_type == "video":
-                await client.send_video(
-                    Config.DUMP_CHANNEL,
-                    video=file_path,
-                    caption=caption,
-                    duration=original_duration,
-                    thumb=thumb_path,
-                    supports_streaming=True
-                )
-            elif file_type == "audio":
-                await client.send_audio(
-                    Config.DUMP_CHANNEL,
-                    audio=file_path,
-                    caption=caption,
-                    thumb=thumb_path
-                )
-            
-            logger.info(f"File dumped to channel: {final_filename} by user {user_id}")
-            return True
-            
-        except errors.ChannelInvalid:
-            logger.error(f"Dump channel invalid: {Config.DUMP_CHANNEL}")
-            return False
-        except errors.ChannelPrivate:
-            logger.error(f"Dump channel is private or bot not member: {Config.DUMP_CHANNEL}")
-            return False
-        except errors.ChatAdminRequired:
-            logger.error(f"Bot needs admin rights in dump channel: {Config.DUMP_CHANNEL}")
-            return False
-        except Exception as e:
-            logger.warning(f"Dump attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(1)
-            else:
-                logger.error(f"All dump attempts failed for {final_filename}: {e}")
-                return False
-    
-    return False
-
-# ========== FILE PROCESSING FUNCTION ==========
-async def process_file_upload(client, message, user_id, upload_type):
-    """Process file upload directly without user selection"""
-    if user_id not in user_states:
         return
     
-    user_data = user_states[user_id]
-    
     try:
-        file_info = user_data['file_info']
-        new_filename = user_data['new_filename']
-        original_message = file_info['original_message']
-        original_duration = file_info['duration']
+        # Prepare caption for dump channel
+        caption = f"**File Name:** `{final_filename}`\n**User ID:** `{user_id}`\n**Type:** `{file_type}`\n**Time:** {time.ctime()}"
         
-        # Get original extension
-        original_name = file_info['file_name']
-        if not original_name or original_name == 'Unknown':
-            original_ext = '.bin'
-        else:
-            _, original_ext = os.path.splitext(original_name)
-            if not original_ext:
-                original_ext = '.bin'
-        
-        final_filename = f"{new_filename}{original_ext}"
-        download_path = f"downloads/{final_filename}"
-        os.makedirs("downloads", exist_ok=True)
-        
-        # Create progress message with cancel button
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_confirm_{user_id}")]
-        ])
-        progress_msg = await message.reply_text("🔄 **Processing your file...**", reply_markup=keyboard)
-        
-        start_time = time.time()
-        
-        # Download with progress
-        file_path = await client.download_media(
-            original_message,
-            file_name=download_path,
-            progress=progress_for_pyrogram,
-            progress_args=("📥 **Downloading File**", progress_msg, start_time, final_filename)
-        )
-        
-        # Check if download was cancelled
-        if user_id in cancellation_flags and cancellation_flags[user_id]:
-            await progress_msg.edit_text("✅ **Download cancelled!**")
-            if file_path and os.path.exists(file_path):
-                try: os.remove(file_path)
-                except: pass
-            await cleanup_user_data(user_id)
-            return
-        
-        if not file_path or not os.path.exists(file_path):
-            raise Exception("Download failed")
-        
-        user_states[user_id]['file_path'] = file_path
-        
-        # Get thumbnail
-        thumbnail = await db.get_thumbnail(user_id)
-        thumb_path = None
-        if thumbnail:
-            try:
-                thumb_path = await client.download_media(thumbnail)
-                user_states[user_id]['thumb_path'] = thumb_path
-            except Exception as e:
-                logger.error(f"Thumbnail download error: {e}")
-        
-        # Update progress message for upload
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_confirm_{user_id}")]
-        ])
-        await progress_msg.edit_text("🔄 **Uploading file...**", reply_markup=keyboard)
-        
-        start_time = time.time()
-        
-        # Send to user based on upload type
-        try:
-            if upload_type == "document":
-                sent_message = await client.send_document(
-                    message.chat.id,
-                    document=file_path,
-                    thumb=thumb_path,
-                    caption=f"`{final_filename}`",
-                    progress=progress_for_pyrogram,
-                    progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
-                )
-            elif upload_type == "video":
-                sent_message = await client.send_video(
-                    message.chat.id,
-                    video=file_path,
-                    thumb=thumb_path,
-                    caption=f"`{final_filename}`",
-                    duration=original_duration,
-                    supports_streaming=True,
-                    progress=progress_for_pyrogram,
-                    progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
-                )
-            elif upload_type == "audio":
-                sent_message = await client.send_audio(
-                    message.chat.id,
-                    audio=file_path,
-                    thumb=thumb_path,
-                    caption=f"`{final_filename}`",
-                    duration=original_duration,
-                    progress=progress_for_pyrogram,
-                    progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
-                )
-        except Exception as e:
-            logger.error(f"Upload error: {e}")
-            # Fallback to document if specific type fails
-            sent_message = await client.send_document(
-                message.chat.id,
+        if file_type == "document":
+            await client.send_document(
+                Config.DUMP_CHANNEL,
                 document=file_path,
+                caption=caption,
+                thumb=thumb_path
+            )
+        elif file_type == "video":
+            await client.send_video(
+                Config.DUMP_CHANNEL,
+                video=file_path,
+                caption=caption,
+                duration=original_duration,
                 thumb=thumb_path,
-                caption=f"`{final_filename}`",
-                progress=progress_for_pyrogram,
-                progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
+                supports_streaming=True
             )
-            upload_type = "document"  # Update type for dump channel
-        
-        # Check if upload was cancelled
-        if user_id in cancellation_flags and cancellation_flags[user_id]:
-            await progress_msg.edit_text("✅ **Upload cancelled!**")
-            return
-        
-        # ✅ SEND TO DUMP CHANNEL (after successful upload to user)
-        if Config.DUMP_CHANNEL:
-            await send_to_dump_channel(
-                client, 
-                file_path, 
-                final_filename, 
-                user_id, 
-                upload_type,
-                original_duration, 
-                thumb_path
+        elif file_type == "audio":
+            await client.send_audio(
+                Config.DUMP_CHANNEL,
+                audio=file_path,
+                caption=caption,
+                thumb=thumb_path
             )
         
-        await message.reply_text(f"✅ **File renamed successfully!**\n\n**New Name:** `{final_filename}`")
-        logger.info(f"User {user_id} successfully renamed file to {final_filename} as {upload_type}")
+        logger.info(f"File dumped to channel: {final_filename} by user {user_id}")
         
-        try:
-            await progress_msg.delete()
-        except:
-            pass
-            
     except Exception as e:
-        error_msg = f"❌ **Error:** `{str(e)}`"
-        await message.reply_text(error_msg)
-        logger.error(f"Upload error for user {user_id}: {e}")
-    
-    finally:
-        # Cleanup
-        await cleanup_user_data(user_id)
+        logger.error(f"Error dumping to channel: {e}")
 
 # ========== ACCESS CONTROL ==========
 def private_access(func):
@@ -575,7 +415,7 @@ async def start_command(client, message):
     if is_owner:
         mode = "PRIVATE" if private_mode else "PUBLIC"
         dump_status = "✅ ENABLED" if Config.DUMP_CHANNEL else "❌ DISABLED"
-        text += f"\n\n**Owner Commands:**\n• /addalloweduser ID\n• /removealloweduser ID\n• /allowedusers\n• /users\n• /mode private|public\n• /dumpchannel ID|off\n• /refreshdialogs - Refresh channel list\n• **Mode:** {mode}\n• **Dump Channel:** {dump_status}"
+        text += f"\n\n**Owner Commands:**\n• /addalloweduser ID\n• /removealloweduser ID\n• /allowedusers\n• /users\n• /mode private|public\n• /dumpchannel ID|off\n• **Mode:** {mode}\n• **Dump Channel:** {dump_status}"
     
     await message.reply_text(text)
 
@@ -654,8 +494,7 @@ async def mode_command(client, message):
 async def dump_channel_command(client, message):
     if len(message.command) < 2:
         current_channel = Config.DUMP_CHANNEL if Config.DUMP_CHANNEL else "Not set"
-        status_msg = f"**Current Dump Channel:** `{current_channel}`\n\n**Usage:** `/dumpchannel CHANNEL_ID`\n\nTo disable: `/dumpchannel off`\n\n**Refresh dialogs:** `/refreshdialogs`"
-        await message.reply_text(status_msg)
+        await message.reply_text(f"**Current Dump Channel:** `{current_channel}`\n\n**Usage:** `/dumpchannel CHANNEL_ID`\n\nTo disable: `/dumpchannel off`")
         return
     
     channel = message.command[1]
@@ -665,58 +504,10 @@ async def dump_channel_command(client, message):
         await message.reply_text("✅ **Dump channel disabled**")
         logger.info(f"Owner {message.from_user.id} disabled dump channel")
     else:
-        # Verify the channel and bot's access
-        try:
-            await message.reply_text("🔄 **Verifying channel access...**")
-            
-            # Test if bot can access the channel
-            test_msg = await client.send_message(
-                channel,
-                "🤖 **Bot connected successfully!**\nThis channel is now set as dump channel."
-            )
-            await test_msg.delete()  # Clean up test message
-            
-            Config.DUMP_CHANNEL = channel
-            await db.set_dump_channel(channel)
-            
-            success_msg = f"""✅ **Dump channel set successfully!**
-
-**Channel:** `{channel}`
-**Status:** ✅ Active
-
-The bot will now forward all renamed files to this channel."""
-            await message.reply_text(success_msg)
-            logger.info(f"Owner {message.from_user.id} set dump channel to {channel}")
-            
-        except errors.ChannelInvalid:
-            await message.reply_text(f"❌ **Invalid channel:** `{channel}`\n\nPlease check:\n• Channel ID/username is correct\n• Bot is added to the channel")
-        except errors.ChannelPrivate:
-            await message.reply_text(f"❌ **Channel is private:** `{channel}`\n\nPlease:\n• Add bot to the channel first\n• Make sure bot has admin rights")
-        except errors.ChatAdminRequired:
-            await message.reply_text(f"❌ **Admin rights required:** `{channel}`\n\nPlease give the bot admin permissions in the channel.")
-        except Exception as e:
-            error_msg = f"❌ **Failed to set dump channel:** `{channel}`\n\n**Error:** {str(e)}\n\n**Troubleshooting:**\n1. Add bot to channel as admin\n2. Use `/refreshdialogs` after adding\n3. Ensure channel ID is correct"
-            await message.reply_text(error_msg)
-            logger.error(f"Failed to set dump channel {channel}: {e}")
-
-@app.on_message(filters.private & filters.command("refreshdialogs"))
-@main_owner_only
-async def refresh_dialogs_command(client, message):
-    """Force refresh bot's dialog list to recognize new channels"""
-    try:
-        await message.reply_text("🔄 **Refreshing bot's dialog list...**\nThis may take a few seconds.")
-        
-        count = 0
-        # This forces pyrogram to update its internal dialog cache
-        async for dialog in client.get_dialogs():
-            count += 1
-        
-        await message.reply_text(f"✅ **Dialog list refreshed!**\n\n**Processed:** {count} chats/dialogs\n\nBot should now recognize all channels where it's admin.")
-        logger.info(f"Owner {message.from_user.id} refreshed dialog list, processed {count} dialogs")
-        
-    except Exception as e:
-        await message.reply_text(f"❌ **Failed to refresh dialogs:** {str(e)}")
-        logger.error(f"Dialog refresh failed: {e}")
+        Config.DUMP_CHANNEL = channel
+        await db.set_dump_channel(channel)
+        await message.reply_text(f"✅ **Dump channel set to:** `{channel}`")
+        logger.info(f"Owner {message.from_user.id} set dump channel to {channel}")
 
 @app.on_message(filters.private & filters.command("backup"))
 @main_owner_only
@@ -973,7 +764,7 @@ async def upload_type_callback(client, callback_query):
         download_path = f"downloads/{final_filename}"
         os.makedirs("downloads", exist_ok=True)
         
-        # Force document upload type if user selects document, regardless of original type
+        # FIX: Force document upload type if user selects document, regardless of original type
         if upload_type == "document":
             # When user selects document, we'll force upload as document
             actual_upload_type = "document"
@@ -1032,7 +823,7 @@ async def upload_type_callback(client, callback_query):
         # Send to user based on selected upload type
         try:
             if actual_upload_type == "document":
-                # Force upload as document regardless of original type
+                # FIX: Force upload as document regardless of original type
                 sent_message = await client.send_document(
                     callback_query.message.chat.id,
                     document=file_path,
@@ -1073,7 +864,6 @@ async def upload_type_callback(client, callback_query):
                 progress=progress_for_pyrogram,
                 progress_args=("📤 **Uploading File**", progress_msg, start_time, final_filename)
             )
-            actual_upload_type = "document"  # Update type for dump channel
         
         # Check if upload was cancelled
         if user_id in cancellation_flags and cancellation_flags[user_id]:
@@ -1110,7 +900,7 @@ async def upload_type_callback(client, callback_query):
         await cleanup_user_data(user_id)
 
 # ========== FILENAME HANDLER ==========
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "addalloweduser", "removealloweduser", "allowedusers", "users", "mode", "dumpchannel", "backup", "refreshdialogs"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "cancel", "view_thumb", "del_thumb", "addalloweduser", "removealloweduser", "allowedusers", "users", "mode", "dumpchannel", "backup"]))
 @private_access
 async def handle_filename(client, message):
     user_id = message.from_user.id
@@ -1129,6 +919,7 @@ async def handle_filename(client, message):
         return
     
     user_states[user_id]['new_filename'] = clean_name
+    user_states[user_id]['step'] = 'awaiting_upload_type'
     
     try:
         await message.delete()
@@ -1141,11 +932,9 @@ async def handle_filename(client, message):
     except:
         pass
     
-    # Get file info
+    # Get file extension
     file_info = user_states[user_id]['file_info']
     original_name = file_info['file_name']
-    
-    # Get original extension
     if not original_name or original_name == 'Unknown':
         if file_info['file_type'] == 'video':
             original_ext = '.mp4'
@@ -1165,19 +954,10 @@ async def handle_filename(client, message):
     
     final_name = f"{clean_name}{original_ext}"
     
-    # AUTO-PROCESS DOCUMENTS - No selection needed
-    if file_info['file_type'] == 'document':
-        await message.reply_text(f"🔄 **Processing document:** `{final_name}`")
-        
-        # Directly start processing as document
-        user_states[user_id]['step'] = 'processing'
-        await process_file_upload(client, message, user_id, 'document')
-        return
-    
-    # For video/audio files, show upload options
-    user_states[user_id]['step'] = 'awaiting_upload_type'
-    
+    # Show appropriate upload options based on file type
     keyboard_buttons = []
+    
+    # Always show document option
     keyboard_buttons.append([InlineKeyboardButton("📄 Document", callback_data="upload_document")])
     
     # Show video option for video files
@@ -1190,16 +970,7 @@ async def handle_filename(client, message):
     
     keyboard = InlineKeyboardMarkup(keyboard_buttons)
     
-    file_type_info = ""
-    if file_info['file_type'] == 'video':
-        file_type_info = "\n\n🎥 **Video file** - Select upload type"
-    elif file_info['file_type'] == 'audio':
-        file_type_info = "\n\n🎵 **Audio file** - Select upload type"
-    
-    await message.reply_text(
-        f"**Select Upload Type:**\n\n**File:** `{final_name}`{file_type_info}", 
-        reply_markup=keyboard
-    )
+    await message.reply_text(f"**Select Upload Type:**\n\n**File:** `{final_name}`", reply_markup=keyboard)
 
 # ========== GRACEFUL SHUTDOWN ==========
 def signal_handler(signum, frame):
